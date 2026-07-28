@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import styles from "./cleaner-form.module.css";
 
 type Status =
@@ -22,19 +22,30 @@ type Status =
   | { kind: "error"; message: string };
 
 const SAFE_ERROR = "Não foi possível concluir a operação.";
+const SUCCESS_VISIBLE_MS = 3000;
 
 export function CleanerForm() {
   const [token, setToken] = useState("");
   const [channelId, setChannelId] = useState("");
   const [status, setStatus] = useState<Status>({ kind: "idle" });
+  const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (successTimerRef.current) clearTimeout(successTimerRef.current);
+    };
+  }, []);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    // Capture and wipe credentials from UI state immediately
     const authToken = token.trim();
     const targetChannelId = channelId.trim();
-    setToken("");
+
+    if (successTimerRef.current) {
+      clearTimeout(successTimerRef.current);
+      successTimerRef.current = null;
+    }
 
     setStatus({
       kind: "loading",
@@ -60,9 +71,6 @@ export function CleanerForm() {
         }),
       });
 
-      // Clear local copies ASAP after request is sent
-      // (authToken goes out of scope after function ends)
-
       if (!response.ok || !response.body) {
         let message = SAFE_ERROR;
         try {
@@ -80,6 +88,8 @@ export function CleanerForm() {
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
+      let finishedOk = false;
+      let sawError = false;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -137,15 +147,23 @@ export function CleanerForm() {
           }
 
           if (event.type === "done") {
+            finishedOk = true;
             setStatus({
               kind: "success",
               percent: 100,
               totalDeleted: event.totalDeleted ?? 0,
               total: event.total ?? event.totalDeleted ?? 0,
             });
+
+            if (successTimerRef.current) clearTimeout(successTimerRef.current);
+            successTimerRef.current = setTimeout(() => {
+              setStatus({ kind: "idle" });
+              successTimerRef.current = null;
+            }, SUCCESS_VISIBLE_MS);
           }
 
           if (event.type === "error") {
+            sawError = true;
             setStatus({
               kind: "error",
               message:
@@ -155,6 +173,10 @@ export function CleanerForm() {
             });
           }
         }
+      }
+
+      if (!finishedOk && !sawError) {
+        setStatus({ kind: "error", message: SAFE_ERROR });
       }
     } catch {
       setStatus({
@@ -172,6 +194,7 @@ export function CleanerForm() {
 
   const isSuccess = status.kind === "success";
   const isLoading = status.kind === "loading";
+  const fieldsLocked = isLoading || isSuccess;
 
   return (
     <form
@@ -195,10 +218,10 @@ export function CleanerForm() {
           value={token}
           onChange={(e) => setToken(e.target.value)}
           required
-          disabled={isLoading || isSuccess}
+          disabled={fieldsLocked}
         />
         <span className={styles.helper}>
-          O token é limpo da tela ao iniciar e nunca é armazenado.
+          O token permanece até você recarregar a página.
         </span>
       </label>
 
@@ -217,7 +240,7 @@ export function CleanerForm() {
           value={channelId}
           onChange={(e) => setChannelId(e.target.value.replace(/\D/g, ""))}
           required
-          disabled={isLoading || isSuccess}
+          disabled={fieldsLocked}
         />
         <span className={styles.helper}>
           Aceita ID da DM ou ID do usuário.
@@ -227,7 +250,7 @@ export function CleanerForm() {
       <button
         className={`${styles.submit} ${isSuccess ? styles.submitSuccess : ""}`}
         type="submit"
-        disabled={isLoading || isSuccess}
+        disabled={fieldsLocked}
       >
         <span className={styles.submitInner}>
           {isSuccess && (
