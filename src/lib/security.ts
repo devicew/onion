@@ -160,11 +160,12 @@ export function safeClientError(err: unknown): string {
     [/token/i, "Credenciais inválidas."],
     [/login|autenticação/i, "Falha na autenticação."],
     [/rate.?limit|too many|muitas tentativas/i, "Muitas tentativas. Aguarde e tente novamente."],
-    [/não encontrado|not found|unknown/i, "Canal ou usuário não encontrado."],
+    [/não encontrado|not found|unknown channel/i, "Canal ou usuário não encontrado."],
     [/DM válida|Group DM/i, "O ID informado não é uma DM válida."],
     [/canal de texto\/voz|servidor válido|não permite limpeza/i, "Canal de servidor inválido."],
+    [/missing permissions|missing access|forbidden|50013|50001/i, "Sem permissão para apagar mensagens neste canal."],
     [/limite|timeout|tempo esgotado/i, "Operação excedeu o limite permitido."],
-    [/acesso|não autorizado|unauthorized/i, "Não autorizado."],
+    [/código de acesso|access code/i, "Código de acesso inválido."],
   ];
 
   for (const [pattern, message] of known) {
@@ -229,11 +230,15 @@ export function validateCsrf(
   return safeEqual(header, cookie);
 }
 
-/** Optional shared access code for multi-user gate (not Discord token). */
+/** Optional shared access code for multi-user gate (not Discord token).
+ * Only enforced when REQUIRE_ACCESS_CODE=1 AND ONION_ACCESS_CODE is set.
+ */
 export function validateOptionalAccessCode(provided: unknown): boolean {
+  if (process.env.REQUIRE_ACCESS_CODE !== "1") return true;
+
   const required = process.env.ONION_ACCESS_CODE?.trim();
   if (!required) return true;
-  if (typeof provided !== "string") return false;
+  if (typeof provided !== "string" || !provided.trim()) return false;
   return safeEqual(provided.trim(), required);
 }
 

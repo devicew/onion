@@ -79,7 +79,7 @@ export async function POST(request: Request) {
   const record = parsed.data as Record<string, unknown>;
 
   if (!validateOptionalAccessCode(record.accessCode)) {
-    return jsonError("Não autorizado.", 401);
+    return jsonError("Código de acesso inválido.", 401);
   }
 
   const modeRaw = typeof record.mode === "string" ? record.mode.trim() : "dm";

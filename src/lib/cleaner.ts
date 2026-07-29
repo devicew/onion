@@ -19,6 +19,8 @@ export type CleanProgress = {
 const MAX_MESSAGES = Number(process.env.MAX_DELETE_MESSAGES ?? 2000);
 const MAX_SCAN_PAGES = Number(process.env.MAX_SCAN_PAGES ?? 50);
 const JOB_TIMEOUT_MS = Number(process.env.CLEAN_TIMEOUT_MS ?? 240_000);
+const DELETE_DELAY_MS = Number(process.env.DELETE_DELAY_MS ?? 1400);
+const FETCH_DELAY_MS = Number(process.env.FETCH_DELAY_MS ?? 900);
 
 const GUILD_TEXT_TYPES = new Set([
   "GUILD_TEXT",
@@ -31,6 +33,15 @@ const GUILD_TEXT_TYPES = new Set([
   "GUILD_FORUM",
   "GUILD_MEDIA",
 ]);
+
+async function sleep(ms: number) {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function delayWithJitter(baseMs: number) {
+  const jitter = Math.floor(Math.random() * 500);
+  return Math.max(300, baseMs + jitter);
+}
 
 async function resolveDmChannel(client: any, id: string) {
   try {
@@ -64,8 +75,10 @@ function isPrivateDm(channel: any) {
 
 function isGuildTextCapable(channel: any) {
   if (!channel) return false;
-  if (GUILD_TEXT_TYPES.has(channel.type)) return true;
-  // Some builds expose numeric types; also accept channels with a message manager
+  if (typeof channel.type === "string" && GUILD_TEXT_TYPES.has(channel.type)) {
+    return true;
+  }
+  // Voice/text channels in servers expose messages + guild
   return Boolean(channel.guildId || channel.guild) && Boolean(channel.messages);
 }
 
@@ -73,6 +86,19 @@ function assertNotTimedOut(startedAt: number) {
   if (Date.now() - startedAt > JOB_TIMEOUT_MS) {
     throw new Error("Operação excedeu o tempo limite.");
   }
+}
+
+async function waitUntilReady(client: any) {
+  if (client.readyAt || client.user) return;
+  await new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("Falha na autenticação."));
+    }, 30_000);
+    client.once("ready", () => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
 }
 
 export async function deleteMessagesFromChannel(
@@ -103,6 +129,7 @@ export async function deleteMessagesFromChannel(
     throwIfAborted();
     try {
       await client.login(authToken as string);
+      await waitUntilReady(client);
     } catch {
       throw new Error("Credenciais inválidas.");
     } finally {
@@ -145,7 +172,17 @@ export async function deleteMessagesFromChannel(
       };
       if (lastMessageId) fetchOptions.before = lastMessageId;
 
-      const messages = await channel.messages.fetch(fetchOptions);
+      let messages;
+      try {
+        messages = await channel.messages.fetch(fetchOptions);
+      } catch (err: any) {
+        const code = err?.code ?? err?.httpStatus;
+        if (code === 50001 || code === 50013 || code === 403) {
+          throw new Error("Sem permissão para ler mensagens neste canal.");
+        }
+        throw new Error("Canal do servidor não encontrado.");
+      }
+
       if (messages.size === 0) break;
 
       for (const msg of messages.values()) {
@@ -166,6 +203,8 @@ export async function deleteMessagesFromChannel(
 
       if (myMessages.length >= MAX_MESSAGES) break;
       if (messages.size < batchSize) break;
+
+      await sleep(delayWithJitter(FETCH_DELAY_MS));
     }
 
     const total = myMessages.length;
@@ -183,6 +222,7 @@ export async function deleteMessagesFromChannel(
     });
 
     let totalDeleted = 0;
+    let permissionFailures = 0;
 
     for (let i = 0; i < myMessages.length; i++) {
       throwIfAborted();
@@ -192,8 +232,16 @@ export async function deleteMessagesFromChannel(
       try {
         await msg.delete();
         totalDeleted++;
-      } catch {
-        // ignore already-deleted / rate-limit / missing permission noise
+        permissionFailures = 0;
+      } catch (err: any) {
+        const code = err?.code ?? err?.httpStatus;
+        if (code === 50013 || code === 50001 || code === 403) {
+          permissionFailures++;
+          if (permissionFailures >= 3 && totalDeleted === 0) {
+            throw new Error("Sem permissão para apagar mensagens neste canal.");
+          }
+        }
+        // ignore already-deleted / transient rate-limit noise
       }
 
       const remaining = Math.max(total - totalDeleted, 0);
@@ -206,6 +254,8 @@ export async function deleteMessagesFromChannel(
         remaining,
         percent,
       });
+
+      await sleep(delayWithJitter(DELETE_DELAY_MS));
     }
 
     myMessages.length = 0;
