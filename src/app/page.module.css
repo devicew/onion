@@ -31,6 +31,10 @@
 .header {
   width: min(100%, 600px);
   margin: 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
   animation: fade 0.6s ease both;
 }
 
@@ -38,6 +42,8 @@
   display: inline-flex;
   align-items: center;
   gap: 0.65rem;
+  text-decoration: none;
+  color: inherit;
 }
 
 .brandDot {
@@ -53,6 +59,26 @@
   font-weight: 700;
   letter-spacing: -0.03em;
   color: var(--white);
+}
+
+.moreLink {
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  padding: 0.55rem 0.95rem;
+  color: var(--muted);
+  font-size: 0.86rem;
+  font-weight: 500;
+  text-decoration: none;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background 0.2s ease;
+}
+
+.moreLink:hover {
+  color: var(--white);
+  border-color: rgba(139, 108, 255, 0.5);
+  background: rgba(139, 108, 255, 0.08);
 }
 
 .main {

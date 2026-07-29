@@ -1,34 +1,22 @@
 import { CleanerForm } from "./cleaner-form";
+import { SiteShell } from "./site-shell";
 import styles from "./page.module.css";
 
 export default function Home() {
   return (
-    <div className={styles.page}>
-      <div className={styles.atmosphere} aria-hidden>
-        <span className={styles.grid} />
-      </div>
+    <SiteShell>
+      <section className={styles.hero}>
+        <p className={styles.kicker}>CL em DM</p>
+        <h1 className={styles.title}>Limpeza de DMs</h1>
+        <p className={styles.subtitle}>
+          Informe o token da conta e o ID do canal para remover suas mensagens
+          diretas.
+        </p>
+      </section>
 
-      <header className={styles.header}>
-        <div className={styles.brand}>
-          <span className={styles.brandDot} aria-hidden />
-          <span className={styles.brandName}>Onion</span>
-        </div>
-      </header>
-
-      <main className={styles.main}>
-        <section className={styles.hero}>
-          <p className={styles.kicker}>Onion Cleaner</p>
-          <h1 className={styles.title}>Limpeza de mensagens</h1>
-          <p className={styles.subtitle}>
-            Informe o token da conta e o ID do canal para remover suas
-            mensagens em DM ou servidor.
-          </p>
-        </section>
-
-        <section className={styles.panel}>
-          <CleanerForm />
-        </section>
-      </main>
-    </div>
+      <section className={styles.panel}>
+        <CleanerForm mode="dm" />
+      </section>
+    </SiteShell>
   );
 }

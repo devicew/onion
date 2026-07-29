@@ -3,7 +3,7 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import styles from "./cleaner-form.module.css";
 
-type CleanMode = "dm" | "guild";
+export type CleanMode = "dm" | "guild";
 
 type Status =
   | { kind: "idle" }
@@ -28,33 +28,6 @@ const SUCCESS_VISIBLE_MS = 3000;
 const CSRF_COOKIE = "onion_csrf";
 const CSRF_HEADER = "x-onion-csrf";
 
-const EXTRA_OPTIONS = [
-  {
-    id: "guild" as const,
-    title: "CL em servidor",
-    description: "Limpa suas mensagens em canal de texto ou chat de voz.",
-    available: true,
-  },
-  {
-    id: "friends" as const,
-    title: "CL em amigos",
-    description: "Em breve.",
-    available: false,
-  },
-  {
-    id: "groups" as const,
-    title: "CL em grupos",
-    description: "Em breve.",
-    available: false,
-  },
-  {
-    id: "export" as const,
-    title: "Exportar histórico",
-    description: "Em breve.",
-    available: false,
-  },
-];
-
 function readCookie(name: string): string {
   if (typeof document === "undefined") return "";
   const match = document.cookie
@@ -70,13 +43,12 @@ function clearInput(input: HTMLInputElement | null) {
   input.value = "";
 }
 
-export function CleanerForm() {
+export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const tokenRef = useRef<HTMLInputElement>(null);
   const [channelId, setChannelId] = useState("");
-  const [mode, setMode] = useState<CleanMode>("dm");
-  const [moreOpen, setMoreOpen] = useState(false);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isGuild = mode === "guild";
 
   useEffect(() => {
     return () => {
@@ -258,7 +230,6 @@ export function CleanerForm() {
   const isSuccess = status.kind === "success";
   const isLoading = status.kind === "loading";
   const fieldsLocked = isLoading || isSuccess;
-  const isGuild = mode === "guild";
 
   return (
     <form
@@ -267,27 +238,6 @@ export function CleanerForm() {
       autoComplete="off"
       data-form-type="other"
     >
-      <div className={styles.modeBar}>
-        <button
-          type="button"
-          className={`${styles.modeChip} ${!isGuild ? styles.modeChipActive : ""}`}
-          onClick={() => setMode("dm")}
-          disabled={fieldsLocked}
-        >
-          CL em DM
-        </button>
-        {isGuild && (
-          <button
-            type="button"
-            className={`${styles.modeChip} ${styles.modeChipActive}`}
-            onClick={() => setMode("guild")}
-            disabled={fieldsLocked}
-          >
-            CL em servidor
-          </button>
-        )}
-      </div>
-
       <label className={styles.field}>
         <span className={styles.label}>Token da conta</span>
         <input
@@ -408,54 +358,6 @@ export function CleanerForm() {
       <div className={styles.status} aria-live="polite">
         {status.kind === "error" && (
           <p className={styles.error}>{status.message}</p>
-        )}
-      </div>
-
-      <div className={styles.moreOptions}>
-        <button
-          type="button"
-          className={styles.moreToggle}
-          onClick={() => setMoreOpen((open) => !open)}
-          aria-expanded={moreOpen}
-          disabled={fieldsLocked}
-        >
-          <span>Mais opções</span>
-          <span className={`${styles.moreChevron} ${moreOpen ? styles.moreChevronOpen : ""}`}>
-            ▾
-          </span>
-        </button>
-
-        {moreOpen && (
-          <div className={styles.moreList}>
-            {EXTRA_OPTIONS.map((option) => {
-              const active = option.available && mode === "guild" && option.id === "guild";
-              return (
-                <button
-                  key={option.id}
-                  type="button"
-                  className={`${styles.moreItem} ${active ? styles.moreItemActive : ""} ${
-                    !option.available ? styles.moreItemDisabled : ""
-                  }`}
-                  disabled={!option.available || fieldsLocked}
-                  onClick={() => {
-                    if (!option.available) return;
-                    if (option.id === "guild") {
-                      setMode("guild");
-                      setMoreOpen(false);
-                    }
-                  }}
-                >
-                  <span className={styles.moreItemTitle}>
-                    {option.title}
-                    {!option.available && (
-                      <span className={styles.soon}>Em breve</span>
-                    )}
-                  </span>
-                  <span className={styles.moreItemDesc}>{option.description}</span>
-                </button>
-              );
-            })}
-          </div>
         )}
       </div>
     </form>
