@@ -6,18 +6,16 @@ import optionStyles from "./opcoes.module.css";
 type ToolId = "dm" | "servidor";
 
 const OPTIONS: Array<{
-  id: ToolId | "friends" | "groups" | "export";
+  id: ToolId;
   href: string;
   title: string;
   description: string;
-  available: boolean;
 }> = [
   {
     id: "dm",
     href: "/",
     title: "CL em DM",
     description: "Limpe suas mensagens em conversas diretas.",
-    available: true,
   },
   {
     id: "servidor",
@@ -25,28 +23,6 @@ const OPTIONS: Array<{
     title: "CL em servidor",
     description:
       "Limpe suas mensagens em canal de texto ou no chat de um canal de voz.",
-    available: true,
-  },
-  {
-    id: "friends",
-    href: "#",
-    title: "CL em amigos",
-    description: "Limpeza em massa nas conversas com amigos.",
-    available: false,
-  },
-  {
-    id: "groups",
-    href: "#",
-    title: "CL em grupos",
-    description: "Remova suas mensagens em grupos privados.",
-    available: false,
-  },
-  {
-    id: "export",
-    href: "#",
-    title: "Exportar histórico",
-    description: "Baixe um backup antes de limpar.",
-    available: false,
   },
 ];
 
@@ -78,24 +54,6 @@ export default async function OpcoesPage({
       <section className={optionStyles.grid}>
         {OPTIONS.map((option) => {
           const isCurrent = atual === option.id;
-
-          if (!option.available) {
-            return (
-              <div
-                key={option.id}
-                className={`${optionStyles.card} ${optionStyles.cardDisabled}`}
-                aria-disabled="true"
-              >
-                <span className={optionStyles.cardTitle}>
-                  {option.title}
-                  <span className={optionStyles.soon}>Em breve</span>
-                </span>
-                <span className={optionStyles.cardDesc}>
-                  {option.description}
-                </span>
-              </div>
-            );
-          }
 
           return (
             <Link

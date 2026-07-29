@@ -328,7 +328,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           <div className={styles.progressMeta}>
             <span>
               {status.phase === "scanning"
-                ? "Mapeando mensagens…"
+                ? "Procurando suas mensagens…"
                 : "Removendo mensagens…"}
             </span>
             <span>{percent}%</span>
@@ -347,10 +347,10 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           </div>
           <p className={styles.progressCount}>
             {status.phase === "scanning"
-              ? "Procurando suas mensagens…"
-              : total > 0
-                ? `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"}`
-                : `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"}`}
+              ? total > 0
+                ? `${total} mensagem${total === 1 ? "" : "s"} encontrada${total === 1 ? "" : "s"}`
+                : "Buscando no histórico do canal"
+              : `${totalDeleted} / ${total}`}
           </p>
         </div>
       )}

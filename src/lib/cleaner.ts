@@ -20,7 +20,7 @@ const MAX_MESSAGES = Number(process.env.MAX_DELETE_MESSAGES ?? 2000);
 const MAX_SCAN_PAGES = Number(process.env.MAX_SCAN_PAGES ?? 40);
 const JOB_TIMEOUT_MS = Number(process.env.CLEAN_TIMEOUT_MS ?? 240_000);
 const DELETE_DELAY_MS = Number(process.env.DELETE_DELAY_MS ?? 1400);
-const FETCH_DELAY_MS = Number(process.env.FETCH_DELAY_MS ?? 900);
+const FETCH_DELAY_MS = Number(process.env.FETCH_DELAY_MS ?? 700);
 
 const GUILD_TEXT_TYPES = new Set([
   "GUILD_TEXT",
@@ -39,12 +39,13 @@ async function sleep(ms: number) {
 }
 
 function delayWithJitter(baseMs: number) {
-  const jitter = Math.floor(Math.random() * 500);
-  return Math.max(300, baseMs + jitter);
+  const jitter = Math.floor(Math.random() * 400);
+  return Math.max(250, baseMs + jitter);
 }
 
-/** Oldest snowflake in a message collection — safe regardless of Collection order. */
-function getOldestMessageId(messages: { keys: () => IterableIterator<string> }): string | null {
+function getOldestMessageId(messages: {
+  keys: () => IterableIterator<string>;
+}): string | null {
   let oldest: string | null = null;
   for (const id of messages.keys()) {
     if (!oldest || BigInt(id) < BigInt(oldest)) oldest = id;
@@ -167,11 +168,10 @@ export async function deleteMessagesFromChannel(
       }
     }
 
-    // Scan + delete page by page (avoids infinite scan and shows real progress)
+    // —— Phase 1: collect ONLY your messages ——
+    const myMessages: any[] = [];
     let beforeId: string | undefined;
     let pages = 0;
-    let totalDeleted = 0;
-    let permissionFailures = 0;
     const seenCursors = new Set<string>();
 
     onProgress?.({
@@ -179,10 +179,10 @@ export async function deleteMessagesFromChannel(
       totalDeleted: 0,
       total: 0,
       remaining: 0,
-      percent: 2,
+      percent: 0,
     });
 
-    while (pages < MAX_SCAN_PAGES && totalDeleted < MAX_MESSAGES) {
+    while (pages < MAX_SCAN_PAGES && myMessages.length < MAX_MESSAGES) {
       throwIfAborted();
       pages += 1;
 
@@ -206,87 +206,104 @@ export async function deleteMessagesFromChannel(
 
       const oldestId = getOldestMessageId(messages);
       if (!oldestId) break;
-
-      // Cursor didn't advance → stop (prevents infinite loop)
       if (beforeId && oldestId === beforeId) break;
       if (seenCursors.has(oldestId)) break;
       seenCursors.add(oldestId);
 
-      const mine: any[] = [];
       for (const msg of messages.values()) {
-        if (msg.author?.id === client.user.id) mine.push(msg);
+        if (msg.author?.id === client.user.id) {
+          myMessages.push(msg);
+          if (myMessages.length >= MAX_MESSAGES) break;
+        }
       }
 
+      // Scan progress only reflects search pages (not fake deletes)
       onProgress?.({
-        phase: mine.length > 0 ? "deleting" : "scanning",
-        totalDeleted,
-        total: Math.max(totalDeleted + mine.length, 1),
-        remaining: mine.length,
-        percent: Math.min(
-          95,
-          Math.round((pages / MAX_SCAN_PAGES) * 90) +
-            (mine.length ? 5 : 0),
-        ),
+        phase: "scanning",
+        totalDeleted: 0,
+        total: myMessages.length,
+        remaining: myMessages.length,
+        percent: Math.min(30, Math.round((pages / MAX_SCAN_PAGES) * 30)),
       });
 
-      for (let i = 0; i < mine.length; i++) {
-        if (totalDeleted >= MAX_MESSAGES) break;
-        throwIfAborted();
-        const msg = mine[i];
-
-        try {
-          await msg.delete();
-          totalDeleted++;
-          permissionFailures = 0;
-        } catch (err: any) {
-          const code = err?.code ?? err?.httpStatus;
-          if (code === 50013 || code === 50001 || code === 403) {
-            permissionFailures++;
-            if (permissionFailures >= 3 && totalDeleted === 0) {
-              throw new Error(
-                "Sem permissão para apagar mensagens neste canal.",
-              );
-            }
-          }
-        }
-
-        const leftInPage = Math.max(mine.length - i - 1, 0);
-        onProgress?.({
-          phase: "deleting",
-          totalDeleted,
-          total: totalDeleted + leftInPage,
-          remaining: leftInPage,
-          percent: Math.min(
-            99,
-            Math.round((pages / MAX_SCAN_PAGES) * 85) +
-              Math.round(((i + 1) / Math.max(mine.length, 1)) * 10),
-          ),
-        });
-
-        await sleep(delayWithJitter(DELETE_DELAY_MS));
-      }
-
       if (messages.size < batchSize) break;
-
       beforeId = oldestId;
       await sleep(delayWithJitter(FETCH_DELAY_MS));
     }
 
+    const total = myMessages.length;
+
+    if (total === 0) {
+      onProgress?.({
+        phase: "deleting",
+        totalDeleted: 0,
+        total: 0,
+        remaining: 0,
+        percent: 100,
+      });
+      return { ok: true as const, totalDeleted: 0, total: 0 };
+    }
+
+    // —— Phase 2: delete with REAL percent (deleted / total) ——
+    onProgress?.({
+      phase: "deleting",
+      totalDeleted: 0,
+      total,
+      remaining: total,
+      percent: 0,
+    });
+
+    let totalDeleted = 0;
+    let permissionFailures = 0;
+
+    for (let i = 0; i < myMessages.length; i++) {
+      throwIfAborted();
+      const msg = myMessages[i];
+      myMessages[i] = null;
+
+      try {
+        await msg.delete();
+        totalDeleted++;
+        permissionFailures = 0;
+      } catch (err: any) {
+        const code = err?.code ?? err?.httpStatus;
+        if (code === 50013 || code === 50001 || code === 403) {
+          permissionFailures++;
+          if (permissionFailures >= 3 && totalDeleted === 0) {
+            throw new Error("Sem permissão para apagar mensagens neste canal.");
+          }
+        }
+      }
+
+      const remaining = Math.max(total - (i + 1), 0);
+      onProgress?.({
+        phase: "deleting",
+        totalDeleted,
+        total,
+        remaining,
+        percent: Math.min(100, Math.round(((i + 1) / total) * 100)),
+      });
+
+      await sleep(delayWithJitter(DELETE_DELAY_MS));
+    }
+
+    myMessages.length = 0;
+
     onProgress?.({
       phase: "deleting",
       totalDeleted,
-      total: totalDeleted,
+      total,
       remaining: 0,
       percent: 100,
     });
 
-    return { ok: true as const, totalDeleted, total: totalDeleted };
+    return { ok: true as const, totalDeleted, total };
   } finally {
     authToken = null;
     try {
       await client.destroy();
     } catch {
-      // ignore destroy errors
+      // ignore
     }
   }
 }
