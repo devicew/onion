@@ -9,11 +9,21 @@ function sanitizeArg(value: unknown): unknown {
   if (typeof value === "string") {
     return value
       .replace(SECRET_PATTERN, "[REDACTED]")
-      .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]");
+      .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
+      .replace(/token["']?\s*[:=]\s*["']?[^"'&\s]+/gi, "token=[REDACTED]");
   }
 
   if (value instanceof Error) {
-    return sanitizeArg(value.message);
+    return new Error(String(sanitizeArg(value.message)));
+  }
+
+  if (value && typeof value === "object") {
+    try {
+      const json = JSON.stringify(value);
+      if (SECRET_PATTERN.test(json)) return "[REDACTED_OBJECT]";
+    } catch {
+      return "[UNSERIALIZABLE]";
+    }
   }
 
   return value;

@@ -230,6 +230,142 @@
   }
 }
 
+.modeBar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.modeChip {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.82rem;
+  font-weight: 500;
+  padding: 0.45rem 0.85rem;
+  cursor: pointer;
+  transition:
+    color 0.2s ease,
+    border-color 0.2s ease,
+    background 0.2s ease;
+}
+
+.modeChip:hover:not(:disabled) {
+  color: var(--white);
+  border-color: rgba(139, 108, 255, 0.45);
+}
+
+.modeChipActive {
+  color: var(--white);
+  border-color: rgba(139, 108, 255, 0.55);
+  background: var(--accent-soft);
+}
+
+.modeChip:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.moreOptions {
+  margin-top: 0.25rem;
+  border-top: 1px solid var(--border);
+  padding-top: 1rem;
+}
+
+.moreToggle {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  font-size: 0.9rem;
+  font-weight: 500;
+  padding: 0.2rem 0;
+  cursor: pointer;
+}
+
+.moreToggle:hover:not(:disabled) {
+  color: var(--white);
+}
+
+.moreToggle:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.moreChevron {
+  transition: transform 0.2s ease;
+  color: var(--accent);
+}
+
+.moreChevronOpen {
+  transform: rotate(180deg);
+}
+
+.moreList {
+  display: grid;
+  gap: 0.55rem;
+  margin-top: 0.85rem;
+}
+
+.moreItem {
+  text-align: left;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: rgba(9, 9, 11, 0.55);
+  padding: 0.85rem 1rem;
+  cursor: pointer;
+  transition:
+    border-color 0.2s ease,
+    background 0.2s ease;
+}
+
+.moreItem:hover:not(:disabled) {
+  border-color: rgba(139, 108, 255, 0.45);
+  background: rgba(139, 108, 255, 0.06);
+}
+
+.moreItemActive {
+  border-color: rgba(139, 108, 255, 0.55);
+  background: rgba(139, 108, 255, 0.1);
+}
+
+.moreItemDisabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.moreItemTitle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--white);
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.moreItemDesc {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  font-size: 0.8rem;
+  line-height: 1.4;
+}
+
+.soon {
+  font-size: 0.68rem;
+  font-weight: 500;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--accent);
+  border: 1px solid rgba(139, 108, 255, 0.35);
+  border-radius: var(--radius-pill);
+  padding: 0.12rem 0.45rem;
+}
+
 @media (max-width: 640px) {
   .tokenRow {
     grid-template-columns: 1fr;

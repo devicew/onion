@@ -48,6 +48,9 @@ export const metadata: Metadata = {
       noimageindex: true,
     },
   },
+  other: {
+    "referrer": "no-referrer",
+  },
 };
 
 export default function RootLayout({

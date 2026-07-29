@@ -17,11 +17,11 @@ export default function Home() {
 
       <main className={styles.main}>
         <section className={styles.hero}>
-          <p className={styles.kicker}>DM Cleaner</p>
-          <h1 className={styles.title}>Limpeza de DMs</h1>
+          <p className={styles.kicker}>Onion Cleaner</p>
+          <h1 className={styles.title}>Limpeza de mensagens</h1>
           <p className={styles.subtitle}>
             Informe o token da conta e o ID do canal para remover suas
-            mensagens.
+            mensagens em DM ou servidor.
           </p>
         </section>
 

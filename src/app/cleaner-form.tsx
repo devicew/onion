@@ -3,6 +3,8 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import styles from "./cleaner-form.module.css";
 
+type CleanMode = "dm" | "guild";
+
 type Status =
   | { kind: "idle" }
   | {
@@ -23,24 +25,74 @@ type Status =
 
 const SAFE_ERROR = "Não foi possível concluir a operação.";
 const SUCCESS_VISIBLE_MS = 3000;
+const CSRF_COOKIE = "onion_csrf";
+const CSRF_HEADER = "x-onion-csrf";
+
+const EXTRA_OPTIONS = [
+  {
+    id: "guild" as const,
+    title: "CL em servidor",
+    description: "Limpa suas mensagens em canal de texto ou chat de voz.",
+    available: true,
+  },
+  {
+    id: "friends" as const,
+    title: "CL em amigos",
+    description: "Em breve.",
+    available: false,
+  },
+  {
+    id: "groups" as const,
+    title: "CL em grupos",
+    description: "Em breve.",
+    available: false,
+  },
+  {
+    id: "export" as const,
+    title: "Exportar histórico",
+    description: "Em breve.",
+    available: false,
+  },
+];
+
+function readCookie(name: string): string {
+  if (typeof document === "undefined") return "";
+  const match = document.cookie
+    .split(";")
+    .map((part) => part.trim())
+    .find((part) => part.startsWith(`${name}=`));
+  if (!match) return "";
+  return decodeURIComponent(match.slice(name.length + 1));
+}
+
+function clearInput(input: HTMLInputElement | null) {
+  if (!input) return;
+  input.value = "";
+}
 
 export function CleanerForm() {
-  const [token, setToken] = useState("");
+  const tokenRef = useRef<HTMLInputElement>(null);
   const [channelId, setChannelId] = useState("");
+  const [mode, setMode] = useState<CleanMode>("dm");
+  const [moreOpen, setMoreOpen] = useState(false);
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     return () => {
       if (successTimerRef.current) clearTimeout(successTimerRef.current);
+      clearInput(tokenRef.current);
     };
   }, []);
 
   async function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
 
-    const authToken = token.trim();
+    const tokenInput = tokenRef.current;
+    const authToken = tokenInput?.value.trim() ?? "";
     const targetChannelId = channelId.trim();
+
+    clearInput(tokenInput);
 
     if (successTimerRef.current) {
       clearTimeout(successTimerRef.current);
@@ -56,20 +108,27 @@ export function CleanerForm() {
       remaining: 0,
     });
 
+    const csrf = readCookie(CSRF_COOKIE);
+    let requestBody: string | null = JSON.stringify({
+      token: authToken,
+      channelId: targetChannelId,
+      mode,
+    });
+
     try {
       const response = await fetch("/api/clean", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
           Accept: "application/x-ndjson",
+          [CSRF_HEADER]: csrf,
         },
         cache: "no-store",
         credentials: "same-origin",
-        body: JSON.stringify({
-          token: authToken,
-          channelId: targetChannelId,
-        }),
+        body: requestBody,
       });
+
+      requestBody = null;
 
       if (!response.ok || !response.body) {
         let message = SAFE_ERROR;
@@ -179,10 +238,14 @@ export function CleanerForm() {
         setStatus({ kind: "error", message: SAFE_ERROR });
       }
     } catch {
+      requestBody = null;
       setStatus({
         kind: "error",
         message: "Falha de conexão com o servidor.",
       });
+    } finally {
+      requestBody = null;
+      clearInput(tokenInput);
     }
   }
 
@@ -195,6 +258,7 @@ export function CleanerForm() {
   const isSuccess = status.kind === "success";
   const isLoading = status.kind === "loading";
   const fieldsLocked = isLoading || isSuccess;
+  const isGuild = mode === "guild";
 
   return (
     <form
@@ -203,30 +267,52 @@ export function CleanerForm() {
       autoComplete="off"
       data-form-type="other"
     >
+      <div className={styles.modeBar}>
+        <button
+          type="button"
+          className={`${styles.modeChip} ${!isGuild ? styles.modeChipActive : ""}`}
+          onClick={() => setMode("dm")}
+          disabled={fieldsLocked}
+        >
+          CL em DM
+        </button>
+        {isGuild && (
+          <button
+            type="button"
+            className={`${styles.modeChip} ${styles.modeChipActive}`}
+            onClick={() => setMode("guild")}
+            disabled={fieldsLocked}
+          >
+            CL em servidor
+          </button>
+        )}
+      </div>
+
       <label className={styles.field}>
         <span className={styles.label}>Token da conta</span>
         <input
+          ref={tokenRef}
           className={styles.input}
           type="password"
           name="onion-auth"
-          autoComplete="new-password"
+          autoComplete="off"
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
           inputMode="text"
           placeholder="Cole o token aqui"
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
           required
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
-          O token permanece até você recarregar a página.
+          O token é usado só nesta requisição e limpo da tela ao enviar.
         </span>
       </label>
 
       <label className={styles.field}>
-        <span className={styles.label}>ID do canal</span>
+        <span className={styles.label}>
+          {isGuild ? "ID do canal do servidor" : "ID do canal"}
+        </span>
         <input
           className={styles.input}
           type="text"
@@ -236,14 +322,20 @@ export function CleanerForm() {
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
-          placeholder="ID do canal ou do usuário"
+          placeholder={
+            isGuild
+              ? "ID do canal de texto ou chat de voz"
+              : "ID do canal ou do usuário"
+          }
           value={channelId}
           onChange={(e) => setChannelId(e.target.value.replace(/\D/g, ""))}
           required
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
-          Aceita ID da DM ou ID do usuário.
+          {isGuild
+            ? "Canal de texto, anúncio ou chat de texto de um canal de voz."
+            : "Aceita ID da DM ou ID do usuário."}
         </span>
       </label>
 
@@ -274,7 +366,9 @@ export function CleanerForm() {
               ? "Concluído"
               : isLoading
                 ? "Limpando…"
-                : "Limpar mensagens"}
+                : isGuild
+                  ? "Limpar canal"
+                  : "Limpar mensagens"}
           </span>
         </span>
       </button>
@@ -314,6 +408,54 @@ export function CleanerForm() {
       <div className={styles.status} aria-live="polite">
         {status.kind === "error" && (
           <p className={styles.error}>{status.message}</p>
+        )}
+      </div>
+
+      <div className={styles.moreOptions}>
+        <button
+          type="button"
+          className={styles.moreToggle}
+          onClick={() => setMoreOpen((open) => !open)}
+          aria-expanded={moreOpen}
+          disabled={fieldsLocked}
+        >
+          <span>Mais opções</span>
+          <span className={`${styles.moreChevron} ${moreOpen ? styles.moreChevronOpen : ""}`}>
+            ▾
+          </span>
+        </button>
+
+        {moreOpen && (
+          <div className={styles.moreList}>
+            {EXTRA_OPTIONS.map((option) => {
+              const active = option.available && mode === "guild" && option.id === "guild";
+              return (
+                <button
+                  key={option.id}
+                  type="button"
+                  className={`${styles.moreItem} ${active ? styles.moreItemActive : ""} ${
+                    !option.available ? styles.moreItemDisabled : ""
+                  }`}
+                  disabled={!option.available || fieldsLocked}
+                  onClick={() => {
+                    if (!option.available) return;
+                    if (option.id === "guild") {
+                      setMode("guild");
+                      setMoreOpen(false);
+                    }
+                  }}
+                >
+                  <span className={styles.moreItemTitle}>
+                    {option.title}
+                    {!option.available && (
+                      <span className={styles.soon}>Em breve</span>
+                    )}
+                  </span>
+                  <span className={styles.moreItemDesc}>{option.description}</span>
+                </button>
+              );
+            })}
+          </div>
         )}
       </div>
     </form>

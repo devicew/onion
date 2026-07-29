@@ -1,12 +1,19 @@
 import { deleteMessagesFromChannel } from "@/lib/cleaner";
+import { releaseJob, tryAcquireJob } from "@/lib/jobs";
 import {
-  assertBodySize,
+  CSRF_COOKIE,
+  CSRF_HEADER,
+  SESSION_COOKIE,
   checkRateLimit,
   getClientIp,
   isAllowedOrigin,
+  parseCookieHeader,
+  readJsonLimited,
   safeClientError,
+  validateCsrf,
   validateChannelId,
   validateDiscordToken,
+  validateOptionalAccessCode,
 } from "@/lib/security";
 
 export const runtime = "nodejs";
@@ -30,68 +37,113 @@ function jsonError(message: string, status: number, extra?: HeadersInit) {
 }
 
 export async function POST(request: Request) {
-  if (!assertBodySize(request)) {
-    return jsonError("Requisição muito grande.", 413);
-  }
-
   if (!isAllowedOrigin(request)) {
     return jsonError("Origem não autorizada.", 403);
   }
 
+  const cookies = parseCookieHeader(request.headers.get("cookie"));
+  if (!validateCsrf(request, cookies)) {
+    return jsonError("CSRF rejeitado.", 403);
+  }
+
+  const sessionId = cookies[SESSION_COOKIE];
+  if (!sessionId || sessionId.length < 20) {
+    return jsonError("Sessão inválida. Recarregue a página.", 401);
+  }
+
   const ip = getClientIp(request);
-  const limited = checkRateLimit(`clean:${ip}`, 5, 15 * 60 * 1000);
-  if (!limited.ok) {
+
+  const ipLimit = checkRateLimit(`ip:${ip}`, 8, 15 * 60 * 1000);
+  if (!ipLimit.ok) {
     return jsonError("Muitas tentativas. Aguarde e tente novamente.", 429, {
-      "Retry-After": String(limited.retryAfterSec),
+      "Retry-After": String(ipLimit.retryAfterSec),
     });
   }
 
-  let body: unknown;
-  try {
-    body = await request.json();
-  } catch {
+  const sessionLimit = checkRateLimit(`sid:${sessionId}`, 5, 15 * 60 * 1000);
+  if (!sessionLimit.ok) {
+    return jsonError("Limite da sessão atingido. Aguarde e tente novamente.", 429, {
+      "Retry-After": String(sessionLimit.retryAfterSec),
+    });
+  }
+
+  const parsed = await readJsonLimited(request, 8_192);
+  if (!parsed.ok) {
+    return jsonError(parsed.error, parsed.status);
+  }
+
+  if (!parsed.data || typeof parsed.data !== "object" || Array.isArray(parsed.data)) {
     return jsonError("Corpo da requisição inválido.", 400);
   }
 
-  if (!body || typeof body !== "object" || Array.isArray(body)) {
-    return jsonError("Corpo da requisição inválido.", 400);
+  const record = parsed.data as Record<string, unknown>;
+
+  if (!validateOptionalAccessCode(record.accessCode)) {
+    return jsonError("Não autorizado.", 401);
   }
 
-  const record = body as Record<string, unknown>;
-  const token = typeof record.token === "string" ? record.token.trim() : "";
+  const modeRaw = typeof record.mode === "string" ? record.mode.trim() : "dm";
+  const mode = modeRaw === "guild" ? "guild" : "dm";
+
+  // Copy then drop immediately from the record reference surface
+  let token = typeof record.token === "string" ? record.token.trim() : "";
   const channelId =
     typeof record.channelId === "string" ? record.channelId.trim() : "";
 
-  // Drop unexpected fields — never trust extra payload data
+  // Prevent accidental retention on the parsed object
+  record.token = undefined;
+  delete record.token;
+
   if (!token || !validateDiscordToken(token)) {
+    token = "";
     return jsonError("Credenciais inválidas.", 400);
   }
 
   if (!channelId || !validateChannelId(channelId)) {
+    token = "";
     return jsonError("ID do canal inválido.", 400);
   }
 
+  const slot = tryAcquireJob(sessionId);
+  if (!slot.ok) {
+    token = "";
+    return jsonError(
+      "Já existe uma limpeza em andamento nesta sessão (ou o servidor está ocupado).",
+      429,
+    );
+  }
+
+  const abort = new AbortController();
+  const timeout = setTimeout(() => abort.abort(), Number(process.env.CLEAN_TIMEOUT_MS ?? 240_000));
+
   const stream = new ReadableStream({
     async start(controller) {
-      let authToken = token;
+      let authToken: string | null = token;
+      token = "";
 
       try {
         controller.enqueue(encode({ type: "start" }));
 
-        const result = await deleteMessagesFromChannel(authToken, channelId, {
-          onProgress: (info) => {
-            controller.enqueue(
-              encode({
-                type: "progress",
-                phase: info.phase,
-                totalDeleted: info.totalDeleted,
-                total: info.total,
-                remaining: info.remaining,
-                percent: info.percent,
-              }),
-            );
+        const result = await deleteMessagesFromChannel(
+          authToken as string,
+          channelId,
+          {
+            mode,
+            signal: abort.signal,
+            onProgress: (info) => {
+              controller.enqueue(
+                encode({
+                  type: "progress",
+                  phase: info.phase,
+                  totalDeleted: info.totalDeleted,
+                  total: info.total,
+                  remaining: info.remaining,
+                  percent: info.percent,
+                }),
+              );
+            },
           },
-        });
+        );
 
         controller.enqueue(
           encode({
@@ -107,9 +159,16 @@ export async function POST(request: Request) {
           encode({ type: "error", error: safeClientError(err) }),
         );
       } finally {
-        authToken = "";
+        authToken = null;
+        clearTimeout(timeout);
+        releaseJob(slot.jobId);
         controller.close();
       }
+    },
+    cancel() {
+      abort.abort();
+      clearTimeout(timeout);
+      releaseJob(slot.jobId);
     },
   });
 
@@ -119,6 +178,8 @@ export async function POST(request: Request) {
       "Cache-Control": "no-store, no-cache, no-transform",
       Pragma: "no-cache",
       "X-Content-Type-Options": "nosniff",
+      // Help clients know CSRF header name without leaking secrets
+      "Access-Control-Expose-Headers": CSRF_HEADER,
     },
   });
 }
