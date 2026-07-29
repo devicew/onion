@@ -4,7 +4,7 @@ import styles from "./page.module.css";
 
 export default function Home() {
   return (
-    <SiteShell>
+    <SiteShell currentTool="dm">
       <section className={styles.hero}>
         <p className={styles.kicker}>CL em DM</p>
         <h1 className={styles.title}>Limpeza de DMs</h1>

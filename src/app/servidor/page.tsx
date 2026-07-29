@@ -4,7 +4,7 @@ import styles from "../page.module.css";
 
 export default function ServidorPage() {
   return (
-    <SiteShell moreHref="/opcoes" moreLabel="Mais opções">
+    <SiteShell currentTool="servidor">
       <section className={styles.hero}>
         <p className={styles.kicker}>CL em servidor</p>
         <h1 className={styles.title}>Limpeza no servidor</h1>

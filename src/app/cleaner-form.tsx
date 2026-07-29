@@ -155,17 +155,17 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
             const total = event.total ?? 0;
             const remaining =
               event.remaining ?? Math.max(total - totalDeleted, 0);
-            const percent =
-              phase === "deleting" && total > 0
-                ? Math.max(
-                    0,
-                    Math.min(
-                      100,
-                      event.percent ??
-                        Math.round((totalDeleted / total) * 100),
-                    ),
-                  )
-                : 0;
+            const percent = Math.max(
+              0,
+              Math.min(
+                100,
+                typeof event.percent === "number"
+                  ? event.percent
+                  : phase === "deleting" && total > 0
+                    ? Math.round((totalDeleted / total) * 100)
+                    : 0,
+              ),
+            );
 
             setStatus({
               kind: "loading",
@@ -347,9 +347,9 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           </div>
           <p className={styles.progressCount}>
             {status.phase === "scanning"
-              ? "Contando suas mensagens no canal"
+              ? "Procurando suas mensagens…"
               : total > 0
-                ? `${totalDeleted} / ${total} · ${remaining} restante${remaining === 1 ? "" : "s"}`
+                ? `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"}`
                 : `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"}`}
           </p>
         </div>

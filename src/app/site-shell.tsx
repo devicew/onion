@@ -1,17 +1,25 @@
 import Link from "next/link";
 import styles from "./page.module.css";
 
+type ToolId = "dm" | "servidor";
+
 type SiteShellProps = {
   children: React.ReactNode;
+  currentTool?: ToolId;
   moreHref?: string;
   moreLabel?: string;
 };
 
 export function SiteShell({
   children,
-  moreHref = "/opcoes",
+  currentTool,
+  moreHref,
   moreLabel = "Mais opções",
 }: SiteShellProps) {
+  const href =
+    moreHref ??
+    (currentTool ? `/opcoes?atual=${currentTool}` : "/opcoes");
+
   return (
     <div className={styles.page}>
       <div className={styles.atmosphere} aria-hidden>
@@ -23,7 +31,7 @@ export function SiteShell({
           <span className={styles.brandDot} aria-hidden />
           <span className={styles.brandName}>Onion</span>
         </Link>
-        <Link href={moreHref} className={styles.moreLink}>
+        <Link href={href} className={styles.moreLink}>
           {moreLabel}
         </Link>
       </header>
