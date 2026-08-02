@@ -1,20 +1,22 @@
 import { deleteMessagesFromChannel } from "@/lib/cleaner";
 import { releaseJob, tryAcquireJob } from "@/lib/jobs";
+import { logJob } from "@/lib/logger";
+import { enforceRateLimit } from "@/lib/rate-limit";
 import {
-  CSRF_COOKIE,
   CSRF_HEADER,
-  SESSION_COOKIE,
-  checkRateLimit,
   getClientIp,
   isAllowedOrigin,
   parseCookieHeader,
   readJsonLimited,
   safeClientError,
-  validateCsrf,
+  tokenFingerprint,
   validateChannelId,
+  validateCleanDirection,
+  validateCleanMode,
+  validateCsrf,
   validateDiscordToken,
-  validateOptionalAccessCode,
 } from "@/lib/security";
+import { readSessionId, SESSION_COOKIE } from "@/lib/session";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -37,6 +39,8 @@ function jsonError(message: string, status: number, extra?: HeadersInit) {
 }
 
 export async function POST(request: Request) {
+  const startedAt = Date.now();
+
   if (!isAllowedOrigin(request)) {
     return jsonError("Origem não autorizada.", 403);
   }
@@ -46,21 +50,21 @@ export async function POST(request: Request) {
     return jsonError("CSRF rejeitado.", 403);
   }
 
-  const sessionId = cookies[SESSION_COOKIE];
-  if (!sessionId || sessionId.length < 20) {
+  const sessionId = readSessionId(cookies[SESSION_COOKIE]);
+  if (!sessionId) {
     return jsonError("Sessão inválida. Recarregue a página.", 401);
   }
 
   const ip = getClientIp(request);
 
-  const ipLimit = checkRateLimit(`ip:${ip}`, 8, 15 * 60 * 1000);
+  const ipLimit = await enforceRateLimit("cleanIp", ip);
   if (!ipLimit.ok) {
     return jsonError("Muitas tentativas. Aguarde e tente novamente.", 429, {
       "Retry-After": String(ipLimit.retryAfterSec),
     });
   }
 
-  const sessionLimit = checkRateLimit(`sid:${sessionId}`, 5, 15 * 60 * 1000);
+  const sessionLimit = await enforceRateLimit("cleanSession", sessionId);
   if (!sessionLimit.ok) {
     return jsonError("Limite da sessão atingido. Aguarde e tente novamente.", 429, {
       "Retry-After": String(sessionLimit.retryAfterSec),
@@ -78,24 +82,26 @@ export async function POST(request: Request) {
 
   const record = parsed.data as Record<string, unknown>;
 
-  if (!validateOptionalAccessCode(record.accessCode)) {
-    return jsonError("Código de acesso inválido.", 401);
+  const mode = validateCleanMode(record.mode);
+  if (!mode) {
+    return jsonError("Modo inválido.", 400);
   }
 
-  const modeRaw = typeof record.mode === "string" ? record.mode.trim() : "dm";
-  const mode = modeRaw === "guild" ? "guild" : "dm";
+  const direction = validateCleanDirection(record.direction);
+  if (!direction) {
+    return jsonError("Direção inválida.", 400);
+  }
 
-  // Copy then drop immediately from the record reference surface
   let token = typeof record.token === "string" ? record.token.trim() : "";
   const channelId =
     typeof record.channelId === "string" ? record.channelId.trim() : "";
 
-  // Prevent accidental retention on the parsed object
   record.token = undefined;
   delete record.token;
 
   if (!token || !validateDiscordToken(token)) {
     token = "";
+    await enforceRateLimit("tokenFingerprint", `bad:${ip}`);
     return jsonError("Credenciais inválidas.", 400);
   }
 
@@ -104,17 +110,48 @@ export async function POST(request: Request) {
     return jsonError("ID do canal inválido.", 400);
   }
 
-  const slot = tryAcquireJob(sessionId);
+  const fp = tokenFingerprint(token);
+  const tokenLimit = await enforceRateLimit("tokenFingerprint", fp);
+  if (!tokenLimit.ok) {
+    token = "";
+    return jsonError("Muitas tentativas. Aguarde e tente novamente.", 429, {
+      "Retry-After": String(tokenLimit.retryAfterSec),
+    });
+  }
+
+  const jobAttempt = await enforceRateLimit("jobCreate", sessionId);
+  if (!jobAttempt.ok) {
+    token = "";
+    return jsonError("Muitas tentativas. Aguarde e tente novamente.", 429, {
+      "Retry-After": String(jobAttempt.retryAfterSec),
+    });
+  }
+
+  const slot = tryAcquireJob(sessionId, channelId, mode);
   if (!slot.ok) {
     token = "";
-    return jsonError(
-      "Já existe uma limpeza em andamento nesta sessão (ou o servidor está ocupado).",
-      429,
-    );
+    const message =
+      slot.reason === "duplicate"
+        ? "Já existe uma limpeza deste canal nesta sessão."
+        : "Já existe uma limpeza em andamento nesta sessão (ou o servidor está ocupado).";
+    logJob({
+      jobId: `rej-${sessionId.slice(0, 8)}`,
+      status: "rejected",
+      reason: slot.reason,
+      mode,
+      durationMs: Date.now() - startedAt,
+    });
+    return jsonError(message, 429);
   }
 
   const abort = new AbortController();
-  const timeout = setTimeout(() => abort.abort(), Number(process.env.CLEAN_TIMEOUT_MS ?? 240_000));
+  const timeout = setTimeout(() => abort.abort(), 240_000);
+
+  logJob({
+    jobId: slot.jobId,
+    status: "start",
+    mode,
+  });
 
   const stream = new ReadableStream({
     async start(controller) {
@@ -129,6 +166,7 @@ export async function POST(request: Request) {
           channelId,
           {
             mode,
+            direction,
             signal: abort.signal,
             onProgress: (info) => {
               controller.enqueue(
@@ -154,10 +192,26 @@ export async function POST(request: Request) {
             percent: 100,
           }),
         );
+
+        logJob({
+          jobId: slot.jobId,
+          status: "done",
+          mode,
+          durationMs: Date.now() - startedAt,
+          totalDeleted: result.totalDeleted,
+          totalFound: result.total,
+        });
       } catch (err) {
         controller.enqueue(
           encode({ type: "error", error: safeClientError(err) }),
         );
+        logJob({
+          jobId: slot.jobId,
+          status: "error",
+          mode,
+          durationMs: Date.now() - startedAt,
+          reason: "job_failed",
+        });
       } finally {
         authToken = null;
         clearTimeout(timeout);
@@ -178,7 +232,6 @@ export async function POST(request: Request) {
       "Cache-Control": "no-store, no-cache, no-transform",
       Pragma: "no-cache",
       "X-Content-Type-Options": "nosniff",
-      // Help clients know CSRF header name without leaking secrets
       "Access-Control-Expose-Headers": CSRF_HEADER,
     },
   });

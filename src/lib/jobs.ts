@@ -1,44 +1,80 @@
-/** In-process session/job limits. No token storage. Server-only. */
+/** In-process job concurrency. No token storage. Server-only. */
 if (typeof window !== "undefined") {
   throw new Error("Módulo restrito ao servidor.");
 }
 
-type JobSlot = {
+import { createHash } from "crypto";
+
+type LocalJob = {
   sessionId: string;
+  fingerprint: string;
   startedAt: number;
 };
 
-const activeJobs = new Map<string, JobSlot>();
-const sessionActiveCount = new Map<string, number>();
+const localJobs = new Map<string, LocalJob>();
+const sessionLocalCount = new Map<string, number>();
 
-const MAX_GLOBAL_JOBS = Number(process.env.MAX_GLOBAL_JOBS ?? 20);
-const MAX_SESSION_JOBS = Number(process.env.MAX_SESSION_JOBS ?? 1);
+const MAX_GLOBAL_JOBS = 12;
+const MAX_SESSION_JOBS = 1;
+const JOB_TTL_MS = 240_000 + 60_000;
 
-export function tryAcquireJob(sessionId: string): { ok: true; jobId: string } | { ok: false } {
-  // purge stale (>10 min)
-  const now = Date.now();
-  for (const [id, job] of activeJobs) {
-    if (now - job.startedAt > 10 * 60 * 1000) {
+export function jobFingerprint(
+  sessionId: string,
+  channelId: string,
+  mode: string,
+): string {
+  return createHash("sha256")
+    .update(`${sessionId}|${channelId}|${mode}`)
+    .digest("hex")
+    .slice(0, 32);
+}
+
+function purgeLocal(now = Date.now()) {
+  for (const [id, job] of localJobs) {
+    if (now - job.startedAt > JOB_TTL_MS) {
       releaseJob(id);
     }
   }
+}
 
-  if (activeJobs.size >= MAX_GLOBAL_JOBS) return { ok: false };
+export function tryAcquireJob(
+  sessionId: string,
+  channelId: string,
+  mode: string,
+): { ok: true; jobId: string } | { ok: false; reason: string } {
+  purgeLocal();
+  const fingerprint = jobFingerprint(sessionId, channelId, mode);
 
-  const current = sessionActiveCount.get(sessionId) ?? 0;
-  if (current >= MAX_SESSION_JOBS) return { ok: false };
+  for (const job of localJobs.values()) {
+    if (job.fingerprint === fingerprint) {
+      return { ok: false, reason: "duplicate" };
+    }
+  }
 
-  const jobId = `${sessionId}:${now}:${Math.random().toString(36).slice(2, 10)}`;
-  activeJobs.set(jobId, { sessionId, startedAt: now });
-  sessionActiveCount.set(sessionId, current + 1);
+  if (localJobs.size >= MAX_GLOBAL_JOBS) {
+    return { ok: false, reason: "global_full" };
+  }
+
+  const current = sessionLocalCount.get(sessionId) ?? 0;
+  if (current >= MAX_SESSION_JOBS) {
+    return { ok: false, reason: "session_busy" };
+  }
+
+  const jobId = `${sessionId.slice(0, 12)}:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`;
+  localJobs.set(jobId, {
+    sessionId,
+    fingerprint,
+    startedAt: Date.now(),
+  });
+  sessionLocalCount.set(sessionId, current + 1);
   return { ok: true, jobId };
 }
 
 export function releaseJob(jobId: string): void {
-  const job = activeJobs.get(jobId);
+  const job = localJobs.get(jobId);
   if (!job) return;
-  activeJobs.delete(jobId);
-  const current = sessionActiveCount.get(job.sessionId) ?? 0;
-  if (current <= 1) sessionActiveCount.delete(job.sessionId);
-  else sessionActiveCount.set(job.sessionId, current - 1);
+  localJobs.delete(jobId);
+  const current = sessionLocalCount.get(job.sessionId) ?? 0;
+  if (current <= 1) sessionLocalCount.delete(job.sessionId);
+  else sessionLocalCount.set(job.sessionId, current - 1);
 }

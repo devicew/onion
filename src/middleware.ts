@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import type { NextRequest } from "next/server";
-
-const CSRF_COOKIE = "onion_csrf";
-const SESSION_COOKIE = "onion_sid";
+import {
+  CSRF_COOKIE,
+  SESSION_COOKIE,
+  createCsrfToken,
+  createSessionId,
+  csrfCookieOptions,
+  readSessionId,
+  sessionCookieOptions,
+} from "@/lib/session";
 
 const securityHeaders: Record<string, string> = {
   "X-Content-Type-Options": "nosniff",
@@ -15,10 +21,10 @@ const securityHeaders: Record<string, string> = {
   "X-DNS-Prefetch-Control": "off",
 };
 
-function buildCsp(isDev: boolean): string {
+function buildCsp(nonce: string, isDev: boolean): string {
   const scriptSrc = isDev
-    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
-    : "script-src 'self' 'unsafe-inline'";
+    ? `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' 'unsafe-eval'`
+    : `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`;
 
   return [
     "default-src 'self'",
@@ -35,17 +41,18 @@ function buildCsp(isDev: boolean): string {
   ].join("; ");
 }
 
-function randomToken(byteLength = 32): string {
-  const bytes = new Uint8Array(byteLength);
+function createNonce(): string {
+  const bytes = new Uint8Array(16);
   crypto.getRandomValues(bytes);
   let binary = "";
   for (const b of bytes) binary += String.fromCharCode(b);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  return btoa(binary);
 }
 
-export function middleware(request: NextRequest) {
+export async function middleware(request: NextRequest) {
   const isDev = process.env.NODE_ENV !== "production";
   const isProd = !isDev;
+  const nonce = createNonce();
 
   if (isProd) {
     const proto =
@@ -58,7 +65,12 @@ export function middleware(request: NextRequest) {
     }
   }
 
-  const response = NextResponse.next();
+  const requestHeaders = new Headers(request.headers);
+  requestHeaders.set("x-nonce", nonce);
+
+  const response = NextResponse.next({
+    request: { headers: requestHeaders },
+  });
 
   for (const [key, value] of Object.entries(securityHeaders)) {
     response.headers.set(key, value);
@@ -71,33 +83,29 @@ export function middleware(request: NextRequest) {
     );
   }
 
-  response.headers.set("Content-Security-Policy", buildCsp(isDev));
+  response.headers.set("Content-Security-Policy", buildCsp(nonce, isDev));
 
   if (request.nextUrl.pathname.startsWith("/api/")) {
     response.headers.set("Cache-Control", "no-store, max-age=0");
   }
 
-  const existingSid = request.cookies.get(SESSION_COOKIE)?.value;
+  const existingSid = readSessionId(request.cookies.get(SESSION_COOKIE)?.value);
   const existingCsrf = request.cookies.get(CSRF_COOKIE)?.value;
 
   if (!existingSid) {
-    response.cookies.set(SESSION_COOKIE, randomToken(24), {
-      httpOnly: true,
-      secure: isProd,
-      sameSite: "strict",
-      path: "/",
-      maxAge: 60 * 60 * 8,
-    });
+    response.cookies.set(
+      SESSION_COOKIE,
+      createSessionId(),
+      sessionCookieOptions(isProd),
+    );
   }
 
-  if (!existingCsrf) {
-    response.cookies.set(CSRF_COOKIE, randomToken(32), {
-      httpOnly: false,
-      secure: isProd,
-      sameSite: "strict",
-      path: "/",
-      maxAge: 60 * 60 * 8,
-    });
+  if (!existingCsrf || existingCsrf.length < 24) {
+    response.cookies.set(
+      CSRF_COOKIE,
+      createCsrfToken(),
+      csrfCookieOptions(isProd),
+    );
   }
 
   return response;

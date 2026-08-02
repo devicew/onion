@@ -3,24 +3,26 @@ if (typeof window !== "undefined") {
   throw new Error("Módulo restrito ao servidor.");
 }
 
-import { createHash, randomBytes, timingSafeEqual } from "crypto";
+import { createHash, timingSafeEqual } from "crypto";
+import {
+  CSRF_COOKIE,
+  CSRF_HEADER,
+  SESSION_COOKIE,
+} from "./session";
 
-export const CSRF_COOKIE = "onion_csrf";
-export const SESSION_COOKIE = "onion_sid";
-export const CSRF_HEADER = "x-onion-csrf";
+export { CSRF_COOKIE, CSRF_HEADER, SESSION_COOKIE };
 
 const TOKEN_PATTERN =
   /[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{20,}/g;
 const SNOWFLAKE_PATTERN = /^\d{17,20}$/;
 
-const rateMap = new Map<string, { count: number; resetAt: number }>();
-
-export function createRandomToken(bytes = 32): string {
-  return randomBytes(bytes).toString("base64url");
-}
-
 export function hashValue(value: string): string {
   return createHash("sha256").update(value).digest("hex");
+}
+
+/** Short fingerprint for rate limits — never reverse to original token. */
+export function tokenFingerprint(token: string): string {
+  return hashValue(`onion-token:${token}`).slice(0, 24);
 }
 
 export function safeEqual(a: string, b: string): boolean {
@@ -28,6 +30,25 @@ export function safeEqual(a: string, b: string): boolean {
   const right = Buffer.from(b);
   if (left.length !== right.length) return false;
   return timingSafeEqual(left, right);
+}
+
+/** Mask sensitive strings: abc12**** */
+export function maskSecret(value: string, visible = 5): string {
+  if (!value) return "";
+  if (value.length <= visible) return "*".repeat(Math.min(value.length, 8));
+  return `${value.slice(0, visible)}${"*".repeat(4)}`;
+}
+
+export function redactSecrets(input: string): string {
+  return input
+    .replace(TOKEN_PATTERN, (m) => maskSecret(m))
+    .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
+    .replace(
+      /token["']?\s*[:=]\s*["']?[^"'&\s]+/gi,
+      "token=[REDACTED]",
+    )
+    .replace(/onion_sid=["']?[^;"'\s]+/gi, "onion_sid=[REDACTED]")
+    .replace(/onion_csrf=["']?[^;"'\s]+/gi, "onion_csrf=[REDACTED]");
 }
 
 /** Only trust forwarded IP headers when behind a known proxy (e.g. Vercel). */
@@ -48,45 +69,15 @@ export function getClientIp(request: Request): string {
   return "direct";
 }
 
-export function checkRateLimit(
-  key: string,
-  limit: number,
-  windowMs: number,
-): { ok: true } | { ok: false; retryAfterSec: number } {
-  const now = Date.now();
-  const current = rateMap.get(key);
-
-  if (!current || now >= current.resetAt) {
-    rateMap.set(key, { count: 1, resetAt: now + windowMs });
-    return { ok: true };
-  }
-
-  if (current.count >= limit) {
-    return {
-      ok: false,
-      retryAfterSec: Math.max(1, Math.ceil((current.resetAt - now) / 1000)),
-    };
-  }
-
-  current.count += 1;
-  rateMap.set(key, current);
-  return { ok: true };
-}
-
 export function getAppOrigins(): Set<string> {
   const configured = process.env.APP_ORIGIN?.trim();
-  const extras = (process.env.ALLOWED_ORIGINS ?? "")
-    .split(",")
-    .map((v) => v.trim())
-    .filter(Boolean);
-
-  const origins = new Set<string>(extras);
+  const origins = new Set<string>();
 
   if (configured) {
     origins.add(configured.replace(/\/$/, ""));
   }
 
-  // Vercel injects these automatically on deploy
+  // Platform-injected on Vercel (not a manual env you configure)
   const vercelUrl = process.env.VERCEL_URL?.trim();
   if (vercelUrl) {
     origins.add(`https://${vercelUrl.replace(/^https?:\/\//, "")}`);
@@ -119,8 +110,6 @@ export function isAllowedOrigin(request: Request): boolean {
     }
   }
 
-  // Same-origin form posts should send Origin in modern browsers.
-  // Reject missing Origin for credential-bearing API calls.
   return false;
 }
 
@@ -130,19 +119,28 @@ export function validateChannelId(value: string): boolean {
 
 export function validateDiscordToken(value: string): boolean {
   if (typeof value !== "string") return false;
-  if (value.length < 50 || value.length > 200) return false;
+  if (value.length < 50 || value.length > 180) return false;
   if (/\s/.test(value)) return false;
-  if (value.length > 180) return false;
   const parts = value.split(".");
-  if (parts.length < 3 || parts.length > 3) return false;
-  return parts.every((part) => /^[A-Za-z0-9_-]+$/.test(part) && part.length >= 3);
+  if (parts.length !== 3) return false;
+  return parts.every(
+    (part) => /^[A-Za-z0-9_-]+$/.test(part) && part.length >= 3,
+  );
 }
 
-export function redactSecrets(input: string): string {
-  return input
-    .replace(TOKEN_PATTERN, "[REDACTED]")
-    .replace(/Bearer\s+\S+/gi, "Bearer [REDACTED]")
-    .replace(/token["']?\s*[:=]\s*["']?[^"'&\s]+/gi, "token=[REDACTED]");
+export function validateCleanMode(value: unknown): "dm" | "guild" | null {
+  if (value === "dm" || value === "guild") return value;
+  if (value === undefined || value === null || value === "") return "dm";
+  return null;
+}
+
+/** newest = de baixo pra cima; oldest = de cima pra baixo */
+export function validateCleanDirection(
+  value: unknown,
+): "newest" | "oldest" | null {
+  if (value === "newest" || value === "oldest") return value;
+  if (value === undefined || value === null || value === "") return "newest";
+  return null;
 }
 
 export function safeClientError(err: unknown): string {
@@ -163,9 +161,8 @@ export function safeClientError(err: unknown): string {
     [/não encontrado|not found|unknown channel/i, "Canal ou usuário não encontrado."],
     [/DM válida|Group DM/i, "O ID informado não é uma DM válida."],
     [/canal de texto\/voz|servidor válido|não permite limpeza/i, "Canal de servidor inválido."],
-    [/missing permissions|missing access|forbidden|50013|50001/i, "Sem permissão para apagar mensagens neste canal."],
-    [/limite|timeout|tempo esgotado/i, "Operação excedeu o limite permitido."],
-    [/código de acesso|access code/i, "Código de acesso inválido."],
+    [/missing permissions|missing access|forbidden|50013|50001|sem permissão/i, "Sem permissão para apagar mensagens neste canal."],
+    [/limite|timeout|tempo esgotado|tempo limite/i, "Operação excedeu o limite permitido."],
   ];
 
   for (const [pattern, message] of known) {
@@ -214,7 +211,11 @@ export function parseCookieHeader(
     const key = part.slice(0, idx).trim();
     const value = part.slice(idx + 1).trim();
     if (!key) continue;
-    out[key] = decodeURIComponent(value);
+    try {
+      out[key] = decodeURIComponent(value);
+    } catch {
+      out[key] = value;
+    }
   }
   return out;
 }
@@ -227,22 +228,6 @@ export function validateCsrf(
   const cookie = cookies[CSRF_COOKIE]?.trim() ?? "";
   if (!header || !cookie) return false;
   if (header.length < 24 || cookie.length < 24) return false;
+  if (header.length > 256 || cookie.length > 256) return false;
   return safeEqual(header, cookie);
-}
-
-/** Optional shared access code for multi-user gate (not Discord token).
- * Only enforced when REQUIRE_ACCESS_CODE=1 AND ONION_ACCESS_CODE is set.
- */
-export function validateOptionalAccessCode(provided: unknown): boolean {
-  if (process.env.REQUIRE_ACCESS_CODE !== "1") return true;
-
-  const required = process.env.ONION_ACCESS_CODE?.trim();
-  if (!required) return true;
-  if (typeof provided !== "string" || !provided.trim()) return false;
-  return safeEqual(provided.trim(), required);
-}
-
-export function wipeString(value: string): void {
-  // Best-effort: JS strings are immutable; caller must drop references.
-  void value;
 }

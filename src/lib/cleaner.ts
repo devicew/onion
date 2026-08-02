@@ -3,10 +3,12 @@ if (typeof window !== "undefined") {
   throw new Error("Módulo restrito ao servidor.");
 }
 
-/* eslint-disable @typescript-eslint/no-explicit-any */
+/* eslint-disable @typescript-eslint/no-explicit-any, @typescript-eslint/no-require-imports */
 const { Client } = require("discord.js-selfbot-v13");
 
 export type CleanMode = "dm" | "guild";
+/** newest = bottom→top (recent first); oldest = top→bottom (oldest first) */
+export type CleanDirection = "newest" | "oldest";
 
 export type CleanProgress = {
   phase: "scanning" | "deleting";
@@ -16,11 +18,12 @@ export type CleanProgress = {
   percent: number;
 };
 
-const MAX_MESSAGES = Number(process.env.MAX_DELETE_MESSAGES ?? 2000);
-const MAX_SCAN_PAGES = Number(process.env.MAX_SCAN_PAGES ?? 40);
-const JOB_TIMEOUT_MS = Number(process.env.CLEAN_TIMEOUT_MS ?? 240_000);
-const DELETE_DELAY_MS = Number(process.env.DELETE_DELAY_MS ?? 1400);
-const FETCH_DELAY_MS = Number(process.env.FETCH_DELAY_MS ?? 700);
+const MAX_MESSAGES = 2000;
+const MAX_SCAN_PAGES = 40;
+const JOB_TIMEOUT_MS = 240_000;
+const DELETE_DELAY_MS = 1400;
+const FETCH_DELAY_MS = 700;
+const MAX_OPERATION_MESSAGES = MAX_MESSAGES;
 
 const GUILD_TEXT_TYPES = new Set([
   "GUILD_TEXT",
@@ -51,6 +54,19 @@ function getOldestMessageId(messages: {
     if (!oldest || BigInt(id) < BigInt(oldest)) oldest = id;
   }
   return oldest;
+}
+
+function sortMessagesByDirection(messages: any[], direction: CleanDirection) {
+  messages.sort((a, b) => {
+    const left = BigInt(a.id);
+    const right = BigInt(b.id);
+    if (left === right) return 0;
+    if (direction === "oldest") {
+      return left < right ? -1 : 1;
+    }
+    // newest first
+    return left > right ? -1 : 1;
+  });
 }
 
 async function resolveDmChannel(client: any, id: string) {
@@ -91,6 +107,75 @@ function isGuildTextCapable(channel: any) {
   return Boolean(channel.guildId || channel.guild) && Boolean(channel.messages);
 }
 
+function assertDmParticipation(client: any, channel: any) {
+  const me = client.user?.id;
+  if (!me) throw new Error("Falha na autenticação.");
+
+  if (channel.type === "DM") {
+    // 1:1 DM — recipient exists and we are the account that opened it
+    if (!channel.recipient && !channel.recipientId) {
+      throw new Error("O ID informado não é uma DM válida.");
+    }
+    return;
+  }
+
+  if (channel.type === "GROUP_DM") {
+    const recipients = channel.recipients;
+    if (recipients?.cache?.has?.(me) || recipients?.has?.(me)) return;
+    // Some builds expose recipients as Collection/Map/array
+    if (Array.isArray(recipients) && recipients.some((u: any) => u?.id === me)) {
+      return;
+    }
+    // If we successfully fetched the channel with this token, treat as OK
+    // but require messages API present.
+    if (channel.messages) return;
+    throw new Error("Sem permissão para apagar mensagens neste canal.");
+  }
+}
+
+function assertGuildAccess(client: any, channel: any) {
+  const me = client.user;
+  if (!me) throw new Error("Falha na autenticação.");
+
+  if (!channel.messages) {
+    throw new Error("Este canal não permite limpeza de mensagens.");
+  }
+
+  // permissionsFor is available on guild channels in discord.js
+  try {
+    const perms = channel.permissionsFor?.(me);
+    if (perms) {
+      const canView =
+        typeof perms.has === "function"
+          ? perms.has("VIEW_CHANNEL")
+          : true;
+      const canRead =
+        typeof perms.has === "function"
+          ? perms.has("READ_MESSAGE_HISTORY")
+          : true;
+      if (!canView || !canRead) {
+        throw new Error("Sem permissão para ler mensagens neste canal.");
+      }
+    }
+  } catch (err: any) {
+    if (err?.message?.includes("Sem permissão")) throw err;
+    // If permissionsFor fails, fall through to probe fetch
+  }
+}
+
+async function probeChannelReadable(channel: any) {
+  try {
+    const probe = await channel.messages.fetch({ limit: 1 });
+    void probe;
+  } catch (err: any) {
+    const code = err?.code ?? err?.httpStatus;
+    if (code === 50001 || code === 50013 || code === 403) {
+      throw new Error("Sem permissão para ler mensagens neste canal.");
+    }
+    throw new Error("Canal do servidor não encontrado.");
+  }
+}
+
 function assertNotTimedOut(startedAt: number) {
   if (Date.now() - startedAt > JOB_TIMEOUT_MS) {
     throw new Error("Operação excedeu o tempo limite.");
@@ -110,17 +195,24 @@ async function waitUntilReady(client: any) {
   });
 }
 
+/**
+ * Deletes ONLY messages authored by the account that owns `token`.
+ * Channel access is verified on the backend after login — never trust the client.
+ */
 export async function deleteMessagesFromChannel(
   token: string,
   channelId: string,
   options: {
     mode?: CleanMode;
+    direction?: CleanDirection;
     batchSize?: number;
     onProgress?: (info: CleanProgress) => void;
     signal?: AbortSignal;
   } = {},
 ) {
   const mode: CleanMode = options.mode === "guild" ? "guild" : "dm";
+  const direction: CleanDirection =
+    options.direction === "oldest" ? "oldest" : "newest";
   const batchSize = Math.min(options.batchSize ?? 100, 100);
   const onProgress = options.onProgress;
   const signal = options.signal;
@@ -145,7 +237,9 @@ export async function deleteMessagesFromChannel(
       authToken = null;
     }
 
-    if (!client.user) throw new Error("Falha na autenticação.");
+    // Token belongs to whoever successfully logged in — that is the only identity we trust.
+    if (!client.user?.id) throw new Error("Falha na autenticação.");
+    const selfId: string = client.user.id;
 
     throwIfAborted();
     const channel =
@@ -153,22 +247,28 @@ export async function deleteMessagesFromChannel(
         ? await resolveGuildChannel(client, channelId)
         : await resolveDmChannel(client, channelId);
 
+    if (!channel) {
+      throw new Error("Canal ou usuário não encontrado.");
+    }
+
     if (mode === "dm") {
       if (!isPrivateDm(channel)) {
         throw new Error("O ID informado não é uma DM válida.");
       }
+      assertDmParticipation(client, channel);
     } else {
       if (!isGuildTextCapable(channel)) {
         throw new Error(
           "O ID não é um canal de texto/voz de servidor válido.",
         );
       }
-      if (!channel.messages) {
-        throw new Error("Este canal não permite limpeza de mensagens.");
-      }
+      assertGuildAccess(client, channel);
     }
 
-    // —— Phase 1: collect ONLY your messages ——
+    // Backend probe: channel must be readable with THIS account
+    await probeChannelReadable(channel);
+
+    // —— Phase 1: collect ONLY messages authored by selfId ——
     const myMessages: any[] = [];
     let beforeId: string | undefined;
     let pages = 0;
@@ -182,7 +282,7 @@ export async function deleteMessagesFromChannel(
       percent: 0,
     });
 
-    while (pages < MAX_SCAN_PAGES && myMessages.length < MAX_MESSAGES) {
+    while (pages < MAX_SCAN_PAGES && myMessages.length < MAX_OPERATION_MESSAGES) {
       throwIfAborted();
       pages += 1;
 
@@ -211,13 +311,13 @@ export async function deleteMessagesFromChannel(
       seenCursors.add(oldestId);
 
       for (const msg of messages.values()) {
-        if (msg.author?.id === client.user.id) {
+        // Hard ownership check — never delete another author's message
+        if (msg.author?.id === selfId) {
           myMessages.push(msg);
-          if (myMessages.length >= MAX_MESSAGES) break;
+          if (myMessages.length >= MAX_OPERATION_MESSAGES) break;
         }
       }
 
-      // Scan progress only reflects search pages (not fake deletes)
       onProgress?.({
         phase: "scanning",
         totalDeleted: 0,
@@ -241,8 +341,11 @@ export async function deleteMessagesFromChannel(
         remaining: 0,
         percent: 100,
       });
-      return { ok: true as const, totalDeleted: 0, total: 0 };
+      return { ok: true as const, totalDeleted: 0, total: 0, selfId };
     }
+
+    // Order deletes to match Discord chat: top=oldest, bottom=newest
+    sortMessagesByDirection(myMessages, direction);
 
     // —— Phase 2: delete with REAL percent (deleted / total) ——
     onProgress?.({
@@ -260,6 +363,11 @@ export async function deleteMessagesFromChannel(
       throwIfAborted();
       const msg = myMessages[i];
       myMessages[i] = null;
+
+      // Re-check authorship before every delete
+      if (!msg || msg.author?.id !== selfId) {
+        continue;
+      }
 
       try {
         await msg.delete();
@@ -297,7 +405,7 @@ export async function deleteMessagesFromChannel(
       percent: 100,
     });
 
-    return { ok: true as const, totalDeleted, total };
+    return { ok: true as const, totalDeleted, total, selfId };
   } finally {
     authToken = null;
     try {

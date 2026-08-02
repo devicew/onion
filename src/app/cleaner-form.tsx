@@ -4,6 +4,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import styles from "./cleaner-form.module.css";
 
 export type CleanMode = "dm" | "guild";
+export type CleanDirection = "newest" | "oldest";
 
 type Status =
   | { kind: "idle" }
@@ -46,14 +47,16 @@ function clearInput(input: HTMLInputElement | null) {
 export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const tokenRef = useRef<HTMLInputElement>(null);
   const [channelId, setChannelId] = useState("");
+  const [direction, setDirection] = useState<CleanDirection>("newest");
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isGuild = mode === "guild";
 
   useEffect(() => {
+    const tokenInput = tokenRef.current;
     return () => {
       if (successTimerRef.current) clearTimeout(successTimerRef.current);
-      clearInput(tokenRef.current);
+      clearInput(tokenInput);
     };
   }, []);
 
@@ -85,6 +88,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
       token: authToken,
       channelId: targetChannelId,
       mode,
+      direction,
     });
 
     try {
@@ -225,7 +229,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const percent = status.kind === "loading" ? status.percent : 0;
   const totalDeleted = status.kind === "loading" ? status.totalDeleted : 0;
   const total = status.kind === "loading" ? status.total : 0;
-  const remaining = status.kind === "loading" ? status.remaining : 0;
 
   const isSuccess = status.kind === "success";
   const isLoading = status.kind === "loading";
@@ -288,6 +291,44 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
             : "Aceita ID da DM ou ID do usuário."}
         </span>
       </label>
+
+      <fieldset className={styles.directionField} disabled={fieldsLocked}>
+        <legend className={styles.label}>Ordem da limpeza</legend>
+        <div className={styles.directionOptions} role="radiogroup">
+          <label className={styles.directionOption}>
+            <input
+              type="radio"
+              name="onion-direction"
+              value="newest"
+              checked={direction === "newest"}
+              onChange={() => setDirection("newest")}
+              disabled={fieldsLocked}
+            />
+            <span className={styles.directionCard}>
+              <span className={styles.directionTitle}>De baixo pra cima</span>
+              <span className={styles.directionDesc}>
+                Começa pelas mensagens mais recentes.
+              </span>
+            </span>
+          </label>
+          <label className={styles.directionOption}>
+            <input
+              type="radio"
+              name="onion-direction"
+              value="oldest"
+              checked={direction === "oldest"}
+              onChange={() => setDirection("oldest")}
+              disabled={fieldsLocked}
+            />
+            <span className={styles.directionCard}>
+              <span className={styles.directionTitle}>De cima pra baixo</span>
+              <span className={styles.directionDesc}>
+                Começa pelas mensagens mais antigas.
+              </span>
+            </span>
+          </label>
+        </div>
+      </fieldset>
 
       <button
         className={`${styles.submit} ${isSuccess ? styles.submitSuccess : ""}`}
