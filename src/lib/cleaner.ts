@@ -7,23 +7,23 @@ if (typeof window !== "undefined") {
 const { Client } = require("discord.js-selfbot-v13");
 
 export type CleanMode = "dm" | "guild";
-/** newest = bottom→top (recent first); oldest = top→bottom (oldest first) */
+/** newest = bottom→top; oldest = top→bottom (first user message → end) */
 export type CleanDirection = "newest" | "oldest";
 
 export type CleanProgress = {
-  phase: "scanning" | "deleting";
+  phase: "locating" | "deleting";
   totalDeleted: number;
   total: number;
   remaining: number;
   percent: number;
+  pagesScanned?: number;
 };
 
-const MAX_MESSAGES = 2000;
-const MAX_SCAN_PAGES = 40;
-const JOB_TIMEOUT_MS = 240_000;
-const DELETE_DELAY_MS = 1400;
-const FETCH_DELAY_MS = 700;
-const MAX_OPERATION_MESSAGES = MAX_MESSAGES;
+const MAX_DELETE_MESSAGES = 50_000;
+const MAX_SCAN_PAGES = 2_000;
+const JOB_TIMEOUT_MS = 290_000; // under Vercel 300s; client can Continuar
+const DELETE_DELAY_MS = 1100;
+const FETCH_DELAY_MS = 550;
 
 const GUILD_TEXT_TYPES = new Set([
   "GUILD_TEXT",
@@ -42,7 +42,7 @@ async function sleep(ms: number) {
 }
 
 function delayWithJitter(baseMs: number) {
-  const jitter = Math.floor(Math.random() * 400);
+  const jitter = Math.floor(Math.random() * 350);
   return Math.max(250, baseMs + jitter);
 }
 
@@ -56,17 +56,27 @@ function getOldestMessageId(messages: {
   return oldest;
 }
 
-function sortMessagesByDirection(messages: any[], direction: CleanDirection) {
-  messages.sort((a, b) => {
-    const left = BigInt(a.id);
-    const right = BigInt(b.id);
-    if (left === right) return 0;
-    if (direction === "oldest") {
-      return left < right ? -1 : 1;
-    }
-    // newest first
-    return left > right ? -1 : 1;
-  });
+function getNewestMessageId(messages: {
+  keys: () => IterableIterator<string>;
+}): string | null {
+  let newest: string | null = null;
+  for (const id of messages.keys()) {
+    if (!newest || BigInt(id) > BigInt(newest)) newest = id;
+  }
+  return newest;
+}
+
+function sortByIdAsc(messages: any[]) {
+  messages.sort((a, b) => (BigInt(a.id) < BigInt(b.id) ? -1 : 1));
+}
+
+function sortByIdDesc(messages: any[]) {
+  messages.sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? -1 : 1));
+}
+
+function snowflakeMinusOne(id: string): string {
+  const n = BigInt(id);
+  return n <= BigInt(0) ? "0" : (n - BigInt(1)).toString();
 }
 
 async function resolveDmChannel(client: any, id: string) {
@@ -112,7 +122,6 @@ function assertDmParticipation(client: any, channel: any) {
   if (!me) throw new Error("Falha na autenticação.");
 
   if (channel.type === "DM") {
-    // 1:1 DM — recipient exists and we are the account that opened it
     if (!channel.recipient && !channel.recipientId) {
       throw new Error("O ID informado não é uma DM válida.");
     }
@@ -122,12 +131,9 @@ function assertDmParticipation(client: any, channel: any) {
   if (channel.type === "GROUP_DM") {
     const recipients = channel.recipients;
     if (recipients?.cache?.has?.(me) || recipients?.has?.(me)) return;
-    // Some builds expose recipients as Collection/Map/array
     if (Array.isArray(recipients) && recipients.some((u: any) => u?.id === me)) {
       return;
     }
-    // If we successfully fetched the channel with this token, treat as OK
-    // but require messages API present.
     if (channel.messages) return;
     throw new Error("Sem permissão para apagar mensagens neste canal.");
   }
@@ -141,14 +147,11 @@ function assertGuildAccess(client: any, channel: any) {
     throw new Error("Este canal não permite limpeza de mensagens.");
   }
 
-  // permissionsFor is available on guild channels in discord.js
   try {
     const perms = channel.permissionsFor?.(me);
     if (perms) {
       const canView =
-        typeof perms.has === "function"
-          ? perms.has("VIEW_CHANNEL")
-          : true;
+        typeof perms.has === "function" ? perms.has("VIEW_CHANNEL") : true;
       const canRead =
         typeof perms.has === "function"
           ? perms.has("READ_MESSAGE_HISTORY")
@@ -159,14 +162,12 @@ function assertGuildAccess(client: any, channel: any) {
     }
   } catch (err: any) {
     if (err?.message?.includes("Sem permissão")) throw err;
-    // If permissionsFor fails, fall through to probe fetch
   }
 }
 
 async function probeChannelReadable(channel: any) {
   try {
-    const probe = await channel.messages.fetch({ limit: 1 });
-    void probe;
+    await channel.messages.fetch({ limit: 1 });
   } catch (err: any) {
     const code = err?.code ?? err?.httpStatus;
     if (code === 50001 || code === 50013 || code === 403) {
@@ -178,7 +179,7 @@ async function probeChannelReadable(channel: any) {
 
 function assertNotTimedOut(startedAt: number) {
   if (Date.now() - startedAt > JOB_TIMEOUT_MS) {
-    throw new Error("Operação excedeu o tempo limite.");
+    throw new Error("TEMPO_LIMITE");
   }
 }
 
@@ -195,9 +196,57 @@ async function waitUntilReady(client: any) {
   });
 }
 
+async function fetchPage(
+  channel: any,
+  opts: { limit: number; before?: string; after?: string },
+) {
+  try {
+    return await channel.messages.fetch(opts);
+  } catch (err: any) {
+    const code = err?.code ?? err?.httpStatus;
+    if (code === 50001 || code === 50013 || code === 403) {
+      throw new Error("Sem permissão para ler mensagens neste canal.");
+    }
+    throw new Error("Canal do servidor não encontrado.");
+  }
+}
+
+function ownFromPage(messages: any, selfId: string): any[] {
+  const mine: any[] = [];
+  for (const msg of messages.values()) {
+    if (msg.author?.id === selfId) mine.push(msg);
+  }
+  return mine;
+}
+
+async function deleteOne(
+  msg: any,
+  selfId: string,
+  state: { permissionFailures: number; totalDeleted: number },
+) {
+  if (!msg || msg.author?.id !== selfId) return false;
+  try {
+    await msg.delete();
+    state.totalDeleted += 1;
+    state.permissionFailures = 0;
+    return true;
+  } catch (err: any) {
+    const code = err?.code ?? err?.httpStatus;
+    if (code === 50013 || code === 50001 || code === 403) {
+      state.permissionFailures += 1;
+      if (state.permissionFailures >= 3 && state.totalDeleted === 0) {
+        throw new Error("Sem permissão para apagar mensagens neste canal.");
+      }
+    }
+    return false;
+  }
+}
+
 /**
  * Deletes ONLY messages authored by the account that owns `token`.
- * Channel access is verified on the backend after login — never trust the client.
+ * Page-by-page: starts deleting without waiting to buffer thousands of messages.
+ * - oldest: locate first own message, then delete forward until the end
+ * - newest: delete from recent history backward
  */
 export async function deleteMessagesFromChannel(
   token: string,
@@ -222,9 +271,14 @@ export async function deleteMessagesFromChannel(
   let authToken: string | null = token;
 
   const throwIfAborted = () => {
-    if (signal?.aborted) throw new Error("Operação cancelada.");
+    if (signal?.aborted) {
+      const reason = (signal as AbortSignal & { reason?: unknown }).reason;
+      throw new Error(reason === "timeout" ? "TEMPO_LIMITE" : "PAUSADO");
+    }
     assertNotTimedOut(startedAt);
   };
+
+  const state = { permissionFailures: 0, totalDeleted: 0 };
 
   try {
     throwIfAborted();
@@ -237,7 +291,6 @@ export async function deleteMessagesFromChannel(
       authToken = null;
     }
 
-    // Token belongs to whoever successfully logged in — that is the only identity we trust.
     if (!client.user?.id) throw new Error("Falha na autenticação.");
     const selfId: string = client.user.id;
 
@@ -247,9 +300,7 @@ export async function deleteMessagesFromChannel(
         ? await resolveGuildChannel(client, channelId)
         : await resolveDmChannel(client, channelId);
 
-    if (!channel) {
-      throw new Error("Canal ou usuário não encontrado.");
-    }
+    if (!channel) throw new Error("Canal ou usuário não encontrado.");
 
     if (mode === "dm") {
       if (!isPrivateDm(channel)) {
@@ -265,147 +316,37 @@ export async function deleteMessagesFromChannel(
       assertGuildAccess(client, channel);
     }
 
-    // Backend probe: channel must be readable with THIS account
     await probeChannelReadable(channel);
 
-    // —— Phase 1: collect ONLY messages authored by selfId ——
-    const myMessages: any[] = [];
-    let beforeId: string | undefined;
-    let pages = 0;
-    const seenCursors = new Set<string>();
-
-    onProgress?.({
-      phase: "scanning",
-      totalDeleted: 0,
-      total: 0,
-      remaining: 0,
-      percent: 0,
-    });
-
-    while (pages < MAX_SCAN_PAGES && myMessages.length < MAX_OPERATION_MESSAGES) {
-      throwIfAborted();
-      pages += 1;
-
-      const fetchOptions: { limit: number; before?: string } = {
-        limit: batchSize,
-      };
-      if (beforeId) fetchOptions.before = beforeId;
-
-      let messages: any;
-      try {
-        messages = await channel.messages.fetch(fetchOptions);
-      } catch (err: any) {
-        const code = err?.code ?? err?.httpStatus;
-        if (code === 50001 || code === 50013 || code === 403) {
-          throw new Error("Sem permissão para ler mensagens neste canal.");
-        }
-        throw new Error("Canal do servidor não encontrado.");
-      }
-
-      if (!messages || messages.size === 0) break;
-
-      const oldestId = getOldestMessageId(messages);
-      if (!oldestId) break;
-      if (beforeId && oldestId === beforeId) break;
-      if (seenCursors.has(oldestId)) break;
-      seenCursors.add(oldestId);
-
-      for (const msg of messages.values()) {
-        // Hard ownership check — never delete another author's message
-        if (msg.author?.id === selfId) {
-          myMessages.push(msg);
-          if (myMessages.length >= MAX_OPERATION_MESSAGES) break;
-        }
-      }
-
-      onProgress?.({
-        phase: "scanning",
-        totalDeleted: 0,
-        total: myMessages.length,
-        remaining: myMessages.length,
-        percent: Math.min(30, Math.round((pages / MAX_SCAN_PAGES) * 30)),
+    if (direction === "oldest") {
+      await cleanOldestFirst(channel, selfId, batchSize, {
+        throwIfAborted,
+        onProgress,
+        state,
       });
-
-      if (messages.size < batchSize) break;
-      beforeId = oldestId;
-      await sleep(delayWithJitter(FETCH_DELAY_MS));
-    }
-
-    const total = myMessages.length;
-
-    if (total === 0) {
-      onProgress?.({
-        phase: "deleting",
-        totalDeleted: 0,
-        total: 0,
-        remaining: 0,
-        percent: 100,
+    } else {
+      await cleanNewestFirst(channel, selfId, batchSize, {
+        throwIfAborted,
+        onProgress,
+        state,
       });
-      return { ok: true as const, totalDeleted: 0, total: 0, selfId };
     }
-
-    // Order deletes to match Discord chat: top=oldest, bottom=newest
-    sortMessagesByDirection(myMessages, direction);
-
-    // —— Phase 2: delete with REAL percent (deleted / total) ——
-    onProgress?.({
-      phase: "deleting",
-      totalDeleted: 0,
-      total,
-      remaining: total,
-      percent: 0,
-    });
-
-    let totalDeleted = 0;
-    let permissionFailures = 0;
-
-    for (let i = 0; i < myMessages.length; i++) {
-      throwIfAborted();
-      const msg = myMessages[i];
-      myMessages[i] = null;
-
-      // Re-check authorship before every delete
-      if (!msg || msg.author?.id !== selfId) {
-        continue;
-      }
-
-      try {
-        await msg.delete();
-        totalDeleted++;
-        permissionFailures = 0;
-      } catch (err: any) {
-        const code = err?.code ?? err?.httpStatus;
-        if (code === 50013 || code === 50001 || code === 403) {
-          permissionFailures++;
-          if (permissionFailures >= 3 && totalDeleted === 0) {
-            throw new Error("Sem permissão para apagar mensagens neste canal.");
-          }
-        }
-      }
-
-      const remaining = Math.max(total - (i + 1), 0);
-      onProgress?.({
-        phase: "deleting",
-        totalDeleted,
-        total,
-        remaining,
-        percent: Math.min(100, Math.round(((i + 1) / total) * 100)),
-      });
-
-      await sleep(delayWithJitter(DELETE_DELAY_MS));
-    }
-
-    myMessages.length = 0;
 
     onProgress?.({
       phase: "deleting",
-      totalDeleted,
-      total,
+      totalDeleted: state.totalDeleted,
+      total: state.totalDeleted,
       remaining: 0,
       percent: 100,
     });
 
-    return { ok: true as const, totalDeleted, total, selfId };
+    return {
+      ok: true as const,
+      totalDeleted: state.totalDeleted,
+      total: state.totalDeleted,
+      selfId,
+      partial: false,
+    };
   } finally {
     authToken = null;
     try {
@@ -413,5 +354,196 @@ export async function deleteMessagesFromChannel(
     } catch {
       // ignore
     }
+  }
+}
+
+async function cleanNewestFirst(
+  channel: any,
+  selfId: string,
+  batchSize: number,
+  ctx: {
+    throwIfAborted: () => void;
+    onProgress?: (info: CleanProgress) => void;
+    state: { permissionFailures: number; totalDeleted: number };
+  },
+) {
+  let beforeId: string | undefined;
+  let pages = 0;
+  const seenCursors = new Set<string>();
+
+  while (pages < MAX_SCAN_PAGES && ctx.state.totalDeleted < MAX_DELETE_MESSAGES) {
+    ctx.throwIfAborted();
+    pages += 1;
+
+    const messages = await fetchPage(channel, {
+      limit: batchSize,
+      before: beforeId,
+    });
+
+    if (!messages || messages.size === 0) break;
+
+    const oldestId = getOldestMessageId(messages);
+    if (!oldestId) break;
+    if (beforeId && oldestId === beforeId) break;
+    if (seenCursors.has(oldestId)) break;
+    seenCursors.add(oldestId);
+
+    const mine = ownFromPage(messages, selfId);
+    sortByIdDesc(mine);
+
+    for (let i = 0; i < mine.length; i++) {
+      ctx.throwIfAborted();
+      if (ctx.state.totalDeleted >= MAX_DELETE_MESSAGES) break;
+
+      await deleteOne(mine[i], selfId, ctx.state);
+      mine[i] = null;
+
+      ctx.onProgress?.({
+        phase: "deleting",
+        totalDeleted: ctx.state.totalDeleted,
+        total: ctx.state.totalDeleted + (mine.length - i - 1),
+        remaining: Math.max(mine.length - i - 1, 0),
+        percent: Math.min(
+          99,
+          8 + Math.floor(Math.log10(ctx.state.totalDeleted + 1) * 28),
+        ),
+        pagesScanned: pages,
+      });
+
+      await sleep(delayWithJitter(DELETE_DELAY_MS));
+    }
+
+    if (messages.size < batchSize) break;
+    beforeId = oldestId;
+    await sleep(delayWithJitter(FETCH_DELAY_MS));
+  }
+}
+
+async function cleanOldestFirst(
+  channel: any,
+  selfId: string,
+  batchSize: number,
+  ctx: {
+    throwIfAborted: () => void;
+    onProgress?: (info: CleanProgress) => void;
+    state: { permissionFailures: number; totalDeleted: number };
+  },
+) {
+  // —— Locate the user's first (oldest) message without buffering all ——
+  let beforeId: string | undefined;
+  let pages = 0;
+  let oldestOwnId: string | null = null;
+  const seenCursors = new Set<string>();
+
+  ctx.onProgress?.({
+    phase: "locating",
+    totalDeleted: 0,
+    total: 0,
+    remaining: 0,
+    percent: 1,
+    pagesScanned: 0,
+  });
+
+  while (pages < MAX_SCAN_PAGES) {
+    ctx.throwIfAborted();
+    pages += 1;
+
+    const messages = await fetchPage(channel, {
+      limit: batchSize,
+      before: beforeId,
+    });
+
+    if (!messages || messages.size === 0) break;
+
+    const oldestId = getOldestMessageId(messages);
+    if (!oldestId) break;
+    if (beforeId && oldestId === beforeId) break;
+    if (seenCursors.has(oldestId)) break;
+    seenCursors.add(oldestId);
+
+    for (const msg of messages.values()) {
+      if (msg.author?.id !== selfId) continue;
+      if (!oldestOwnId || BigInt(msg.id) < BigInt(oldestOwnId)) {
+        oldestOwnId = msg.id;
+      }
+    }
+
+    ctx.onProgress?.({
+      phase: "locating",
+      totalDeleted: 0,
+      total: oldestOwnId ? 1 : 0,
+      remaining: 0,
+      percent: Math.min(35, Math.round((pages / Math.max(pages + 5, 20)) * 35)),
+      pagesScanned: pages,
+    });
+
+    if (messages.size < batchSize) break;
+    beforeId = oldestId;
+    await sleep(delayWithJitter(FETCH_DELAY_MS));
+  }
+
+  if (!oldestOwnId) {
+    ctx.onProgress?.({
+      phase: "deleting",
+      totalDeleted: 0,
+      total: 0,
+      remaining: 0,
+      percent: 100,
+    });
+    return;
+  }
+
+  // —— Delete from first own message forward until the end ——
+  let afterId = snowflakeMinusOne(oldestOwnId);
+  let deletePages = 0;
+  const seenAfter = new Set<string>();
+
+  while (
+    deletePages < MAX_SCAN_PAGES &&
+    ctx.state.totalDeleted < MAX_DELETE_MESSAGES
+  ) {
+    ctx.throwIfAborted();
+    deletePages += 1;
+
+    const messages = await fetchPage(channel, {
+      limit: batchSize,
+      after: afterId,
+    });
+
+    if (!messages || messages.size === 0) break;
+
+    const newestId = getNewestMessageId(messages);
+    if (!newestId) break;
+    if (seenAfter.has(newestId)) break;
+    seenAfter.add(newestId);
+
+    const mine = ownFromPage(messages, selfId);
+    sortByIdAsc(mine);
+
+    for (let i = 0; i < mine.length; i++) {
+      ctx.throwIfAborted();
+      if (ctx.state.totalDeleted >= MAX_DELETE_MESSAGES) break;
+
+      await deleteOne(mine[i], selfId, ctx.state);
+      mine[i] = null;
+
+      ctx.onProgress?.({
+        phase: "deleting",
+        totalDeleted: ctx.state.totalDeleted,
+        total: ctx.state.totalDeleted + (mine.length - i - 1),
+        remaining: Math.max(mine.length - i - 1, 0),
+        percent: Math.min(
+          99,
+          40 + Math.floor(Math.log10(ctx.state.totalDeleted + 1) * 22),
+        ),
+        pagesScanned: pages + deletePages,
+      });
+
+      await sleep(delayWithJitter(DELETE_DELAY_MS));
+    }
+
+    if (messages.size < batchSize) break;
+    afterId = newestId;
+    await sleep(delayWithJitter(FETCH_DELAY_MS));
   }
 }

@@ -145,7 +145,8 @@ export async function POST(request: Request) {
   }
 
   const abort = new AbortController();
-  const timeout = setTimeout(() => abort.abort(), 240_000);
+  // Align with Vercel maxDuration (~300s); client can Continuar afterwards
+  const timeout = setTimeout(() => abort.abort("timeout"), 290_000);
 
   logJob({
     jobId: slot.jobId,
@@ -202,16 +203,48 @@ export async function POST(request: Request) {
           totalFound: result.total,
         });
       } catch (err) {
-        controller.enqueue(
-          encode({ type: "error", error: safeClientError(err) }),
-        );
-        logJob({
-          jobId: slot.jobId,
-          status: "error",
-          mode,
-          durationMs: Date.now() - startedAt,
-          reason: "job_failed",
-        });
+        const raw = err instanceof Error ? err.message : "";
+        if (raw === "PAUSADO") {
+          controller.enqueue(
+            encode({
+              type: "paused",
+              error: "Limpeza pausada.",
+            }),
+          );
+          logJob({
+            jobId: slot.jobId,
+            status: "done",
+            mode,
+            durationMs: Date.now() - startedAt,
+            reason: "paused",
+          });
+        } else if (raw === "TEMPO_LIMITE") {
+          controller.enqueue(
+            encode({
+              type: "partial",
+              error:
+                "Tempo da sessão esgotado. Continue para seguir apagando.",
+            }),
+          );
+          logJob({
+            jobId: slot.jobId,
+            status: "done",
+            mode,
+            durationMs: Date.now() - startedAt,
+            reason: "timeout_partial",
+          });
+        } else {
+          controller.enqueue(
+            encode({ type: "error", error: safeClientError(err) }),
+          );
+          logJob({
+            jobId: slot.jobId,
+            status: "error",
+            mode,
+            durationMs: Date.now() - startedAt,
+            reason: "job_failed",
+          });
+        }
       } finally {
         authToken = null;
         clearTimeout(timeout);
@@ -220,7 +253,7 @@ export async function POST(request: Request) {
       }
     },
     cancel() {
-      abort.abort();
+      abort.abort("pause");
       clearTimeout(timeout);
       releaseJob(slot.jobId);
     },

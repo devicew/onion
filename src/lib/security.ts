@@ -153,6 +153,13 @@ export function safeClientError(err: unknown): string {
 
   const cleaned = redactSecrets(raw).trim();
 
+  if (/^PAUSADO$/i.test(cleaned)) {
+    return "Limpeza pausada.";
+  }
+  if (/^TEMPO_LIMITE$/i.test(cleaned)) {
+    return "Tempo da sessão esgotado. Continue para seguir apagando.";
+  }
+
   const known: Array<[RegExp, string]> = [
     [/invalid token|credenciais inválidas/i, "Credenciais inválidas."],
     [/token/i, "Credenciais inválidas."],
@@ -162,7 +169,8 @@ export function safeClientError(err: unknown): string {
     [/DM válida|Group DM/i, "O ID informado não é uma DM válida."],
     [/canal de texto\/voz|servidor válido|não permite limpeza/i, "Canal de servidor inválido."],
     [/missing permissions|missing access|forbidden|50013|50001|sem permissão/i, "Sem permissão para apagar mensagens neste canal."],
-    [/limite|timeout|tempo esgotado|tempo limite/i, "Operação excedeu o limite permitido."],
+    [/limite|timeout|tempo esgotado|tempo limite|TEMPO_LIMITE/i, "Tempo da sessão esgotado. Continue para seguir apagando."],
+    [/PAUSADO|pausad/i, "Limpeza pausada."],
   ];
 
   for (const [pattern, message] of known) {

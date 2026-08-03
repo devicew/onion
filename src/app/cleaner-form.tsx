@@ -6,15 +6,23 @@ import styles from "./cleaner-form.module.css";
 export type CleanMode = "dm" | "guild";
 export type CleanDirection = "newest" | "oldest";
 
+type ProgressPhase = "locating" | "scanning" | "deleting";
+
 type Status =
   | { kind: "idle" }
   | {
       kind: "loading";
-      phase: "scanning" | "deleting";
+      phase: ProgressPhase;
       percent: number;
       totalDeleted: number;
       total: number;
       remaining: number;
+      pagesScanned?: number;
+    }
+  | {
+      kind: "paused";
+      totalDeleted: number;
+      message: string;
     }
   | {
       kind: "success";
@@ -46,8 +54,13 @@ function clearInput(input: HTMLInputElement | null) {
 
 export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const tokenRef = useRef<HTMLInputElement>(null);
+  /** Kept only while a job can be resumed (pause / timeout). Cleared on success/unmount. */
+  const resumeTokenRef = useRef<string>("");
+  const abortRef = useRef<AbortController | null>(null);
+  const sessionDeletedRef = useRef(0);
+
   const [channelId, setChannelId] = useState("");
-  const [direction, setDirection] = useState<CleanDirection>("newest");
+  const [direction, setDirection] = useState<CleanDirection>("oldest");
   const [status, setStatus] = useState<Status>({ kind: "idle" });
   const successTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const isGuild = mode === "guild";
@@ -56,30 +69,40 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
     const tokenInput = tokenRef.current;
     return () => {
       if (successTimerRef.current) clearTimeout(successTimerRef.current);
+      abortRef.current?.abort("pause");
+      resumeTokenRef.current = "";
       clearInput(tokenInput);
     };
   }, []);
 
-  async function onSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
+  function pauseClean() {
+    abortRef.current?.abort("pause");
+  }
 
-    const tokenInput = tokenRef.current;
-    const authToken = tokenInput?.value.trim() ?? "";
-    const targetChannelId = channelId.trim();
-
-    clearInput(tokenInput);
-
+  async function runClean(authToken: string) {
     if (successTimerRef.current) {
       clearTimeout(successTimerRef.current);
       successTimerRef.current = null;
     }
 
+    const targetChannelId = channelId.trim();
+    if (!authToken || !targetChannelId) {
+      setStatus({ kind: "error", message: "Preencha token e ID do canal." });
+      return;
+    }
+
+    resumeTokenRef.current = authToken;
+    if (tokenRef.current) tokenRef.current.value = "";
+
+    const abort = new AbortController();
+    abortRef.current = abort;
+
     setStatus({
       kind: "loading",
-      phase: "scanning",
+      phase: direction === "oldest" ? "locating" : "deleting",
       percent: 0,
-      totalDeleted: 0,
-      total: 0,
+      totalDeleted: sessionDeletedRef.current,
+      total: sessionDeletedRef.current,
       remaining: 0,
     });
 
@@ -102,6 +125,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         cache: "no-store",
         credentials: "same-origin",
         body: requestBody,
+        signal: abort.signal,
       });
 
       requestBody = null;
@@ -116,6 +140,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         } catch {
           // keep default
         }
+        resumeTokenRef.current = "";
         setStatus({ kind: "error", message });
         return;
       }
@@ -125,6 +150,9 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
       let buffer = "";
       let finishedOk = false;
       let sawError = false;
+      let sawPaused = false;
+      let sawPartial = false;
+      let lastDeleted = sessionDeletedRef.current;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -139,11 +167,12 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
 
           let event: {
             type?: string;
-            phase?: "scanning" | "deleting";
+            phase?: ProgressPhase;
             totalDeleted?: number;
             total?: number;
             remaining?: number;
             percent?: number;
+            pagesScanned?: number;
             error?: string;
           };
 
@@ -155,19 +184,17 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
 
           if (event.type === "progress") {
             const phase = event.phase ?? "deleting";
-            const totalDeleted = event.totalDeleted ?? 0;
-            const total = event.total ?? 0;
+            const batchDeleted = event.totalDeleted ?? 0;
+            const totalDeleted = sessionDeletedRef.current + batchDeleted;
+            lastDeleted = totalDeleted;
+            const total = Math.max(event.total ?? 0, batchDeleted) + sessionDeletedRef.current;
             const remaining =
               event.remaining ?? Math.max(total - totalDeleted, 0);
             const percent = Math.max(
               0,
               Math.min(
-                100,
-                typeof event.percent === "number"
-                  ? event.percent
-                  : phase === "deleting" && total > 0
-                    ? Math.round((totalDeleted / total) * 100)
-                    : 0,
+                99,
+                typeof event.percent === "number" ? event.percent : 0,
               ),
             );
 
@@ -178,16 +205,21 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
               totalDeleted,
               total,
               remaining,
+              pagesScanned: event.pagesScanned,
             });
           }
 
           if (event.type === "done") {
             finishedOk = true;
+            const batchDeleted = event.totalDeleted ?? 0;
+            const totalDeleted = sessionDeletedRef.current + batchDeleted;
+            sessionDeletedRef.current = 0;
+            resumeTokenRef.current = "";
             setStatus({
               kind: "success",
               percent: 100,
-              totalDeleted: event.totalDeleted ?? 0,
-              total: event.total ?? event.totalDeleted ?? 0,
+              totalDeleted,
+              total: totalDeleted,
             });
 
             if (successTimerRef.current) clearTimeout(successTimerRef.current);
@@ -197,8 +229,31 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
             }, SUCCESS_VISIBLE_MS);
           }
 
+          if (event.type === "paused") {
+            sawPaused = true;
+            sessionDeletedRef.current = lastDeleted;
+            setStatus({
+              kind: "paused",
+              totalDeleted: lastDeleted,
+              message: "Limpeza pausada. Clique em Continuar para retomar.",
+            });
+          }
+
+          if (event.type === "partial") {
+            sawPartial = true;
+            sessionDeletedRef.current = lastDeleted;
+            setStatus({
+              kind: "paused",
+              totalDeleted: lastDeleted,
+              message:
+                "Tempo da sessão esgotado. Clique em Continuar para seguir até o fim.",
+            });
+          }
+
           if (event.type === "error") {
             sawError = true;
+            resumeTokenRef.current = "";
+            sessionDeletedRef.current = 0;
             setStatus({
               kind: "error",
               message:
@@ -210,28 +265,75 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         }
       }
 
-      if (!finishedOk && !sawError) {
-        setStatus({ kind: "error", message: SAFE_ERROR });
+      if (!finishedOk && !sawError && !sawPaused && !sawPartial) {
+        if (abort.signal.aborted) {
+          sessionDeletedRef.current = lastDeleted;
+          setStatus({
+            kind: "paused",
+            totalDeleted: lastDeleted,
+            message: "Limpeza pausada. Clique em Continuar para retomar.",
+          });
+        } else {
+          resumeTokenRef.current = "";
+          setStatus({ kind: "error", message: SAFE_ERROR });
+        }
       }
-    } catch {
+    } catch (err) {
       requestBody = null;
-      setStatus({
-        kind: "error",
-        message: "Falha de conexão com o servidor.",
-      });
+      if (err instanceof DOMException && err.name === "AbortError") {
+        setStatus({
+          kind: "paused",
+          totalDeleted: sessionDeletedRef.current,
+          message: "Limpeza pausada. Clique em Continuar para retomar.",
+        });
+      } else {
+        resumeTokenRef.current = "";
+        setStatus({
+          kind: "error",
+          message: "Falha de conexão com o servidor.",
+        });
+      }
     } finally {
       requestBody = null;
-      clearInput(tokenInput);
+      abortRef.current = null;
     }
+  }
+
+  async function onSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+
+    const fromInput = tokenRef.current?.value.trim() ?? "";
+    const authToken = fromInput || resumeTokenRef.current;
+    if (fromInput) sessionDeletedRef.current = 0;
+
+    await runClean(authToken);
+  }
+
+  async function onContinue() {
+    const authToken = resumeTokenRef.current;
+    if (!authToken) {
+      setStatus({
+        kind: "error",
+        message: "Cole o token novamente para continuar.",
+      });
+      return;
+    }
+    await runClean(authToken);
   }
 
   const showProgress = status.kind === "loading";
   const percent = status.kind === "loading" ? status.percent : 0;
-  const totalDeleted = status.kind === "loading" ? status.totalDeleted : 0;
+  const totalDeleted =
+    status.kind === "loading" || status.kind === "paused"
+      ? status.totalDeleted
+      : status.kind === "success"
+        ? status.totalDeleted
+        : 0;
   const total = status.kind === "loading" ? status.total : 0;
 
   const isSuccess = status.kind === "success";
   const isLoading = status.kind === "loading";
+  const isPaused = status.kind === "paused";
   const fieldsLocked = isLoading || isSuccess;
 
   return (
@@ -253,12 +355,17 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           autoCorrect="off"
           spellCheck={false}
           inputMode="text"
-          placeholder="Cole o token aqui"
-          required
+          placeholder={
+            isPaused
+              ? "Token guardado para continuar (ou cole de novo)"
+              : "Cole o token aqui"
+          }
+          required={!isPaused}
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
-          O token é usado só nesta requisição e limpo da tela ao enviar.
+          O token fica só nesta sessão do navegador para pausar/continuar e é
+          apagado ao concluir.
         </span>
       </label>
 
@@ -299,6 +406,22 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
             <input
               type="radio"
               name="onion-direction"
+              value="oldest"
+              checked={direction === "oldest"}
+              onChange={() => setDirection("oldest")}
+              disabled={fieldsLocked}
+            />
+            <span className={styles.directionCard}>
+              <span className={styles.directionTitle}>De cima pra baixo</span>
+              <span className={styles.directionDesc}>
+                Da primeira mensagem sua até o final.
+              </span>
+            </span>
+          </label>
+          <label className={styles.directionOption}>
+            <input
+              type="radio"
+              name="onion-direction"
               value="newest"
               checked={direction === "newest"}
               onChange={() => setDirection("newest")}
@@ -311,93 +434,124 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
               </span>
             </span>
           </label>
-          <label className={styles.directionOption}>
-            <input
-              type="radio"
-              name="onion-direction"
-              value="oldest"
-              checked={direction === "oldest"}
-              onChange={() => setDirection("oldest")}
-              disabled={fieldsLocked}
-            />
-            <span className={styles.directionCard}>
-              <span className={styles.directionTitle}>De cima pra baixo</span>
-              <span className={styles.directionDesc}>
-                Começa pelas mensagens mais antigas.
-              </span>
-            </span>
-          </label>
         </div>
       </fieldset>
 
-      <button
-        className={`${styles.submit} ${isSuccess ? styles.submitSuccess : ""}`}
-        type="submit"
-        disabled={fieldsLocked}
-      >
-        <span className={styles.submitInner}>
-          {isSuccess && (
-            <svg
-              className={styles.submitCheck}
-              viewBox="0 0 24 24"
-              fill="none"
-              aria-hidden
-            >
-              <path
-                d="M5 13l4 4L19 7"
-                stroke="currentColor"
-                strokeWidth="2.4"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-              />
-            </svg>
-          )}
-          <span className={styles.submitLabel}>
-            {isSuccess
-              ? "Concluído"
-              : isLoading
-                ? "Limpando…"
-                : isGuild
-                  ? "Limpar canal"
-                  : "Limpar mensagens"}
-          </span>
-        </span>
-      </button>
+      <div className={styles.actions}>
+        {!isPaused && (
+          <button
+            className={`${styles.submit} ${isSuccess ? styles.submitSuccess : ""}`}
+            type="submit"
+            disabled={fieldsLocked}
+          >
+            <span className={styles.submitInner}>
+              {isSuccess && (
+                <svg
+                  className={styles.submitCheck}
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  aria-hidden
+                >
+                  <path
+                    d="M5 13l4 4L19 7"
+                    stroke="currentColor"
+                    strokeWidth="2.4"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              )}
+              <span className={styles.submitLabel}>
+                {isSuccess
+                  ? "Concluído"
+                  : isLoading
+                    ? "Limpando…"
+                    : isGuild
+                      ? "Limpar canal"
+                      : "Limpar mensagens"}
+              </span>
+            </span>
+          </button>
+        )}
 
-      {showProgress && (
+        {isLoading && (
+          <button
+            className={styles.pauseBtn}
+            type="button"
+            onClick={pauseClean}
+          >
+            Pausar
+          </button>
+        )}
+
+        {isPaused && (
+          <>
+            <button
+              className={styles.submit}
+              type="button"
+              onClick={onContinue}
+            >
+              Continuar limpeza
+            </button>
+            <button
+              className={styles.pauseBtn}
+              type="button"
+              onClick={() => {
+                resumeTokenRef.current = "";
+                sessionDeletedRef.current = 0;
+                clearInput(tokenRef.current);
+                setStatus({ kind: "idle" });
+              }}
+            >
+              Cancelar
+            </button>
+          </>
+        )}
+      </div>
+
+      {(showProgress || isPaused) && (
         <div className={styles.progressBlock}>
           <div className={styles.progressMeta}>
             <span>
-              {status.phase === "scanning"
-                ? "Procurando suas mensagens…"
-                : "Removendo mensagens…"}
+              {isPaused
+                ? "Pausado"
+                : status.kind === "loading" && status.phase === "locating"
+                  ? "Localizando sua primeira mensagem…"
+                  : "Removendo mensagens…"}
             </span>
-            <span>{percent}%</span>
+            <span>{isPaused ? "—" : `${percent}%`}</span>
           </div>
           <div
             className={styles.progressTrack}
             role="progressbar"
             aria-valuemin={0}
             aria-valuemax={100}
-            aria-valuenow={percent}
+            aria-valuenow={isPaused ? undefined : percent}
           >
             <div
               className={styles.progressFill}
-              style={{ width: `${percent}%` }}
+              style={{ width: isPaused ? "100%" : `${percent}%` }}
             />
           </div>
           <p className={styles.progressCount}>
-            {status.phase === "scanning"
-              ? total > 0
-                ? `${total} mensagem${total === 1 ? "" : "s"} encontrada${total === 1 ? "" : "s"}`
-                : "Buscando no histórico do canal"
-              : `${totalDeleted} / ${total}`}
+            {isPaused
+              ? `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"} nesta sessão`
+              : status.kind === "loading" && status.phase === "locating"
+                ? status.pagesScanned
+                  ? `Varredura do histórico · página ${status.pagesScanned}`
+                  : "Varredura do histórico do canal"
+                : `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"}${
+                    total > totalDeleted ? ` · lote atual` : ""
+                  }`}
           </p>
         </div>
       )}
 
       <div className={styles.status} aria-live="polite">
         {status.kind === "error" && (
+          <p className={styles.error}>{status.message}</p>
+        )}
+        {status.kind === "paused" && (
           <p className={styles.error}>{status.message}</p>
         )}
       </div>
