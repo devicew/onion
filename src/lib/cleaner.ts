@@ -21,6 +21,14 @@ export type CleanProgress = {
 /** Soft safety only — real stop is empty history. Client auto-continues on timeout. */
 const MAX_PAGES_PER_JOB = 100_000;
 const JOB_TIMEOUT_MS = 290_000;
+/** Steady pace to avoid Discord 429 spikes (DM + servidor). */
+const DELETE_DELAY_MS = 750;
+const FETCH_DELAY_MS = 280;
+
+function delayWithJitter(baseMs: number) {
+  const jitter = Math.floor(Math.random() * 180);
+  return Math.max(200, baseMs + jitter);
+}
 
 const GUILD_TEXT_TYPES = new Set([
   "GUILD_TEXT",
@@ -444,10 +452,12 @@ async function cleanNewestFirst(
       await deleteOne(mine[i], selfId, ctx.state);
       mine[i] = null;
       reportProgress(ctx.onProgress, ctx.state, mine.length - i - 1);
+      await sleep(delayWithJitter(DELETE_DELAY_MS));
     }
 
     if (messages.size < batchSize) break;
     beforeId = oldestId;
+    await sleep(delayWithJitter(FETCH_DELAY_MS));
   }
 }
 
@@ -490,9 +500,11 @@ async function cleanOldestFirst(
       await deleteOne(mine[i], selfId, ctx.state);
       mine[i] = null;
       reportProgress(ctx.onProgress, ctx.state, mine.length - i - 1);
+      await sleep(delayWithJitter(DELETE_DELAY_MS));
     }
 
     if (messages.size < batchSize) break;
     afterId = newestId;
+    await sleep(delayWithJitter(FETCH_DELAY_MS));
   }
 }

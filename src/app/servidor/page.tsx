@@ -10,7 +10,7 @@ export default function ServidorPage() {
         <h1 className={styles.title}>Limpeza no servidor</h1>
         <p className={styles.subtitle}>
           Informe o token e o ID de um canal de texto ou do chat de um canal de
-          voz para remover suas mensagens.
+          voz. Apaga até o fim, com a mesma ordem e pausa da limpeza em DM.
         </p>
       </section>
 

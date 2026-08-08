@@ -66,7 +66,7 @@
 
 .directionChips {
   position: absolute;
-  top: -0.1cm;
+  top: -1.7cm;
   right: 0;
   z-index: 2;
   display: inline-flex;
