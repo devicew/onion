@@ -46,12 +46,12 @@
   color: inherit;
 }
 
-.brandLogo {
-  width: 2.75rem;
-  height: 2.75rem;
+.brandDot {
+  width: 9px;
+  height: 9px;
   border-radius: 50%;
-  object-fit: cover;
-  flex-shrink: 0;
+  background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
 }
 
 .brandName {

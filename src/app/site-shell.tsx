@@ -1,4 +1,3 @@
-import Image from "next/image";
 import Link from "next/link";
 import styles from "./page.module.css";
 
@@ -29,14 +28,7 @@ export function SiteShell({
 
       <header className={styles.header}>
         <Link href="/" className={styles.brand}>
-          <Image
-            src="/onion.png"
-            alt="Onion"
-            width={44}
-            height={44}
-            className={styles.brandLogo}
-            priority
-          />
+          <span className={styles.brandDot} aria-hidden />
           <span className={styles.brandName}>Onion</span>
         </Link>
         <Link href={href} className={styles.moreLink}>
