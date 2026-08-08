@@ -47,8 +47,8 @@
 }
 
 .brandLogo {
-  width: 2rem;
-  height: 2rem;
+  width: 2.75rem;
+  height: 2.75rem;
   border-radius: 50%;
   object-fit: cover;
   flex-shrink: 0;

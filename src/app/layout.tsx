@@ -40,8 +40,14 @@ export const metadata: Metadata = {
   title: "Onion",
   description: "Ferramenta local de limpeza de DMs.",
   icons: {
-    icon: [{ url: "/onion.png", type: "image/png" }],
-    apple: [{ url: "/onion.png", type: "image/png" }],
+    icon: [
+      { url: "/favicon-32.png", sizes: "32x32", type: "image/png" },
+      { url: "/favicon-48.png", sizes: "48x48", type: "image/png" },
+      { url: "/favicon-64.png", sizes: "64x64", type: "image/png" },
+      { url: "/icon-192.png", sizes: "192x192", type: "image/png" },
+    ],
+    apple: [{ url: "/icon-192.png", sizes: "180x180", type: "image/png" }],
+    shortcut: ["/favicon-64.png"],
   },
   robots: {
     index: false,
