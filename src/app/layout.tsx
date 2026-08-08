@@ -39,6 +39,10 @@ const poppins = localFont({
 export const metadata: Metadata = {
   title: "Onion",
   description: "Ferramenta local de limpeza de DMs.",
+  icons: {
+    icon: [{ url: "/onion.png", type: "image/png" }],
+    apple: [{ url: "/onion.png", type: "image/png" }],
+  },
   robots: {
     index: false,
     follow: false,
