@@ -6,18 +6,12 @@ import styles from "./cleaner-form.module.css";
 export type CleanMode = "dm" | "guild";
 export type CleanDirection = "newest" | "oldest";
 
-type ProgressPhase = "locating" | "scanning" | "deleting";
-
 type Status =
   | { kind: "idle" }
   | {
       kind: "loading";
-      phase: ProgressPhase;
       percent: number;
       totalDeleted: number;
-      total: number;
-      remaining: number;
-      pagesScanned?: number;
     }
   | {
       kind: "paused";
@@ -31,6 +25,8 @@ type Status =
       total: number;
     }
   | { kind: "error"; message: string };
+
+type RunOutcome = "done" | "paused" | "partial" | "error";
 
 const SAFE_ERROR = "Não foi possível concluir a operação.";
 const SUCCESS_VISIBLE_MS = 3000;
@@ -79,33 +75,11 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
     abortRef.current?.abort("pause");
   }
 
-  async function runClean(authToken: string) {
-    if (successTimerRef.current) {
-      clearTimeout(successTimerRef.current);
-      successTimerRef.current = null;
-    }
-
+  async function runCleanBatch(
+    authToken: string,
+    signal: AbortSignal,
+  ): Promise<RunOutcome> {
     const targetChannelId = channelId.trim();
-    if (!authToken || !targetChannelId) {
-      setStatus({ kind: "error", message: "Preencha token e ID do canal." });
-      return;
-    }
-
-    resumeTokenRef.current = authToken;
-    if (tokenRef.current) tokenRef.current.value = "";
-
-    const abort = new AbortController();
-    abortRef.current = abort;
-
-    setStatus({
-      kind: "loading",
-      phase: direction === "oldest" ? "locating" : "deleting",
-      percent: 0,
-      totalDeleted: sessionDeletedRef.current,
-      total: sessionDeletedRef.current,
-      remaining: 0,
-    });
-
     const csrf = readCookie(CSRF_COOKIE);
     let requestBody: string | null = JSON.stringify({
       token: authToken,
@@ -125,7 +99,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         cache: "no-store",
         credentials: "same-origin",
         body: requestBody,
-        signal: abort.signal,
+        signal,
       });
 
       requestBody = null;
@@ -142,17 +116,15 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         }
         resumeTokenRef.current = "";
         setStatus({ kind: "error", message });
-        return;
+        return "error";
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = "";
-      let finishedOk = false;
-      let sawError = false;
-      let sawPaused = false;
-      let sawPartial = false;
+      let outcome: RunOutcome | null = null;
       let lastDeleted = sessionDeletedRef.current;
+      let batchBase = sessionDeletedRef.current;
 
       while (true) {
         const { done, value } = await reader.read();
@@ -167,12 +139,8 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
 
           let event: {
             type?: string;
-            phase?: ProgressPhase;
             totalDeleted?: number;
-            total?: number;
-            remaining?: number;
             percent?: number;
-            pagesScanned?: number;
             error?: string;
           };
 
@@ -183,13 +151,9 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           }
 
           if (event.type === "progress") {
-            const phase = event.phase ?? "deleting";
             const batchDeleted = event.totalDeleted ?? 0;
-            const totalDeleted = sessionDeletedRef.current + batchDeleted;
+            const totalDeleted = batchBase + batchDeleted;
             lastDeleted = totalDeleted;
-            const total = Math.max(event.total ?? 0, batchDeleted) + sessionDeletedRef.current;
-            const remaining =
-              event.remaining ?? Math.max(total - totalDeleted, 0);
             const percent = Math.max(
               0,
               Math.min(
@@ -197,61 +161,26 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
                 typeof event.percent === "number" ? event.percent : 0,
               ),
             );
-
-            setStatus({
-              kind: "loading",
-              phase,
-              percent,
-              totalDeleted,
-              total,
-              remaining,
-              pagesScanned: event.pagesScanned,
-            });
+            setStatus({ kind: "loading", percent, totalDeleted });
           }
 
           if (event.type === "done") {
-            finishedOk = true;
             const batchDeleted = event.totalDeleted ?? 0;
-            const totalDeleted = sessionDeletedRef.current + batchDeleted;
-            sessionDeletedRef.current = 0;
-            resumeTokenRef.current = "";
-            setStatus({
-              kind: "success",
-              percent: 100,
-              totalDeleted,
-              total: totalDeleted,
-            });
-
-            if (successTimerRef.current) clearTimeout(successTimerRef.current);
-            successTimerRef.current = setTimeout(() => {
-              setStatus({ kind: "idle" });
-              successTimerRef.current = null;
-            }, SUCCESS_VISIBLE_MS);
+            lastDeleted = batchBase + batchDeleted;
+            outcome = "done";
           }
 
           if (event.type === "paused") {
-            sawPaused = true;
             sessionDeletedRef.current = lastDeleted;
-            setStatus({
-              kind: "paused",
-              totalDeleted: lastDeleted,
-              message: "Limpeza pausada. Clique em Continuar para retomar.",
-            });
+            outcome = "paused";
           }
 
           if (event.type === "partial") {
-            sawPartial = true;
             sessionDeletedRef.current = lastDeleted;
-            setStatus({
-              kind: "paused",
-              totalDeleted: lastDeleted,
-              message:
-                "Tempo da sessão esgotado. Clique em Continuar para seguir até o fim.",
-            });
+            outcome = "partial";
           }
 
           if (event.type === "error") {
-            sawError = true;
             resumeTokenRef.current = "";
             sessionDeletedRef.current = 0;
             setStatus({
@@ -261,23 +190,61 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
                   ? event.error
                   : SAFE_ERROR,
             });
+            outcome = "error";
           }
         }
       }
 
-      if (!finishedOk && !sawError && !sawPaused && !sawPartial) {
-        if (abort.signal.aborted) {
-          sessionDeletedRef.current = lastDeleted;
-          setStatus({
-            kind: "paused",
-            totalDeleted: lastDeleted,
-            message: "Limpeza pausada. Clique em Continuar para retomar.",
-          });
-        } else {
-          resumeTokenRef.current = "";
-          setStatus({ kind: "error", message: SAFE_ERROR });
-        }
+      if (outcome === "done") {
+        sessionDeletedRef.current = 0;
+        resumeTokenRef.current = "";
+        setStatus({
+          kind: "success",
+          percent: 100,
+          totalDeleted: lastDeleted,
+          total: lastDeleted,
+        });
+        if (successTimerRef.current) clearTimeout(successTimerRef.current);
+        successTimerRef.current = setTimeout(() => {
+          setStatus({ kind: "idle" });
+          successTimerRef.current = null;
+        }, SUCCESS_VISIBLE_MS);
+        return "done";
       }
+
+      if (outcome === "paused") {
+        setStatus({
+          kind: "paused",
+          totalDeleted: lastDeleted,
+          message: "Limpeza pausada. Clique em Continuar para retomar.",
+        });
+        return "paused";
+      }
+
+      if (outcome === "partial") {
+        setStatus({
+          kind: "loading",
+          percent: 99,
+          totalDeleted: lastDeleted,
+        });
+        return "partial";
+      }
+
+      if (outcome === "error") return "error";
+
+      if (signal.aborted) {
+        sessionDeletedRef.current = lastDeleted;
+        setStatus({
+          kind: "paused",
+          totalDeleted: lastDeleted,
+          message: "Limpeza pausada. Clique em Continuar para retomar.",
+        });
+        return "paused";
+      }
+
+      resumeTokenRef.current = "";
+      setStatus({ kind: "error", message: SAFE_ERROR });
+      return "error";
     } catch (err) {
       requestBody = null;
       if (err instanceof DOMException && err.name === "AbortError") {
@@ -286,16 +253,52 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           totalDeleted: sessionDeletedRef.current,
           message: "Limpeza pausada. Clique em Continuar para retomar.",
         });
-      } else {
-        resumeTokenRef.current = "";
-        setStatus({
-          kind: "error",
-          message: "Falha de conexão com o servidor.",
-        });
+        return "paused";
       }
-    } finally {
-      requestBody = null;
+      resumeTokenRef.current = "";
+      setStatus({
+        kind: "error",
+        message: "Falha de conexão com o servidor.",
+      });
+      return "error";
+    }
+  }
+
+  /** Keeps going automatically until history is exhausted (or user pauses). */
+  async function runClean(authToken: string) {
+    if (successTimerRef.current) {
+      clearTimeout(successTimerRef.current);
+      successTimerRef.current = null;
+    }
+
+    const targetChannelId = channelId.trim();
+    if (!authToken || !targetChannelId) {
+      setStatus({ kind: "error", message: "Preencha token e ID do canal." });
+      return;
+    }
+
+    resumeTokenRef.current = authToken;
+    if (tokenRef.current) tokenRef.current.value = "";
+
+    setStatus({
+      kind: "loading",
+      percent: 0,
+      totalDeleted: sessionDeletedRef.current,
+    });
+
+    // Auto-continue across serverless time limits until finished
+    for (let round = 0; round < 500; round++) {
+      const abort = new AbortController();
+      abortRef.current = abort;
+
+      const outcome = await runCleanBatch(authToken, abort.signal);
       abortRef.current = null;
+
+      if (outcome === "partial") {
+        // Seamless restart — no user click
+        continue;
+      }
+      break;
     }
   }
 
@@ -329,7 +332,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
       : status.kind === "success"
         ? status.totalDeleted
         : 0;
-  const total = status.kind === "loading" ? status.total : 0;
 
   const isSuccess = status.kind === "success";
   const isLoading = status.kind === "loading";
@@ -343,6 +345,37 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
       autoComplete="off"
       data-form-type="other"
     >
+      <div
+        className={styles.directionChips}
+        role="radiogroup"
+        aria-label="Ordem da limpeza"
+      >
+        <button
+          type="button"
+          className={`${styles.directionChip} ${
+            direction === "oldest" ? styles.directionChipActive : ""
+          }`}
+          aria-pressed={direction === "oldest"}
+          title="De cima pra baixo"
+          disabled={fieldsLocked}
+          onClick={() => setDirection("oldest")}
+        >
+          ↓
+        </button>
+        <button
+          type="button"
+          className={`${styles.directionChip} ${
+            direction === "newest" ? styles.directionChipActive : ""
+          }`}
+          aria-pressed={direction === "newest"}
+          title="De baixo pra cima"
+          disabled={fieldsLocked}
+          onClick={() => setDirection("newest")}
+        >
+          ↑
+        </button>
+      </div>
+
       <label className={styles.field}>
         <span className={styles.label}>Token da conta</span>
         <input
@@ -364,8 +397,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
-          O token fica só nesta sessão do navegador para pausar/continuar e é
-          apagado ao concluir.
+          O token fica só nesta sessão para pausar e é apagado ao concluir.
         </span>
       </label>
 
@@ -398,44 +430,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
             : "Aceita ID da DM ou ID do usuário."}
         </span>
       </label>
-
-      <fieldset className={styles.directionField} disabled={fieldsLocked}>
-        <legend className={styles.label}>Ordem da limpeza</legend>
-        <div className={styles.directionOptions} role="radiogroup">
-          <label className={styles.directionOption}>
-            <input
-              type="radio"
-              name="onion-direction"
-              value="oldest"
-              checked={direction === "oldest"}
-              onChange={() => setDirection("oldest")}
-              disabled={fieldsLocked}
-            />
-            <span className={styles.directionCard}>
-              <span className={styles.directionTitle}>De cima pra baixo</span>
-              <span className={styles.directionDesc}>
-                Da primeira mensagem sua até o final.
-              </span>
-            </span>
-          </label>
-          <label className={styles.directionOption}>
-            <input
-              type="radio"
-              name="onion-direction"
-              value="newest"
-              checked={direction === "newest"}
-              onChange={() => setDirection("newest")}
-              disabled={fieldsLocked}
-            />
-            <span className={styles.directionCard}>
-              <span className={styles.directionTitle}>De baixo pra cima</span>
-              <span className={styles.directionDesc}>
-                Começa pelas mensagens mais recentes.
-              </span>
-            </span>
-          </label>
-        </div>
-      </fieldset>
 
       <div className={styles.actions}>
         {!isPaused && (
@@ -512,13 +506,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
       {(showProgress || isPaused) && (
         <div className={styles.progressBlock}>
           <div className={styles.progressMeta}>
-            <span>
-              {isPaused
-                ? "Pausado"
-                : status.kind === "loading" && status.phase === "locating"
-                  ? "Localizando sua primeira mensagem…"
-                  : "Removendo mensagens…"}
-            </span>
+            <span>{isPaused ? "Pausado" : "Removendo mensagens…"}</span>
             <span>{isPaused ? "—" : `${percent}%`}</span>
           </div>
           <div
@@ -534,15 +522,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
             />
           </div>
           <p className={styles.progressCount}>
-            {isPaused
-              ? `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"} nesta sessão`
-              : status.kind === "loading" && status.phase === "locating"
-                ? status.pagesScanned
-                  ? `Varredura do histórico · página ${status.pagesScanned}`
-                  : "Varredura do histórico do canal"
-                : `${totalDeleted} removida${totalDeleted === 1 ? "" : "s"}${
-                    total > totalDeleted ? ` · lote atual` : ""
-                  }`}
+            {`${totalDeleted} removida${totalDeleted === 1 ? "" : "s"}`}
           </p>
         </div>
       )}

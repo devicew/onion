@@ -7,23 +7,20 @@ if (typeof window !== "undefined") {
 const { Client } = require("discord.js-selfbot-v13");
 
 export type CleanMode = "dm" | "guild";
-/** newest = bottom→top; oldest = top→bottom (first user message → end) */
+/** newest = bottom→top; oldest = top→bottom */
 export type CleanDirection = "newest" | "oldest";
 
 export type CleanProgress = {
-  phase: "locating" | "deleting";
+  phase: "deleting";
   totalDeleted: number;
   total: number;
   remaining: number;
   percent: number;
-  pagesScanned?: number;
 };
 
-const MAX_DELETE_MESSAGES = 50_000;
-const MAX_SCAN_PAGES = 2_000;
-const JOB_TIMEOUT_MS = 290_000; // under Vercel 300s; client can Continuar
-const DELETE_DELAY_MS = 1100;
-const FETCH_DELAY_MS = 550;
+/** Soft safety only — real stop is empty history. Client auto-continues on timeout. */
+const MAX_PAGES_PER_JOB = 100_000;
+const JOB_TIMEOUT_MS = 290_000;
 
 const GUILD_TEXT_TYPES = new Set([
   "GUILD_TEXT",
@@ -39,11 +36,6 @@ const GUILD_TEXT_TYPES = new Set([
 
 async function sleep(ms: number) {
   await new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function delayWithJitter(baseMs: number) {
-  const jitter = Math.floor(Math.random() * 350);
-  return Math.max(250, baseMs + jitter);
 }
 
 function getOldestMessageId(messages: {
@@ -74,9 +66,18 @@ function sortByIdDesc(messages: any[]) {
   messages.sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? -1 : 1));
 }
 
-function snowflakeMinusOne(id: string): string {
-  const n = BigInt(id);
-  return n <= BigInt(0) ? "0" : (n - BigInt(1)).toString();
+function retryAfterMs(err: any): number | null {
+  const retry =
+    err?.retryAfter ??
+    err?.retry_after ??
+    err?.data?.retry_after ??
+    err?.rawError?.retry_after;
+  if (typeof retry === "number" && Number.isFinite(retry)) {
+    return Math.max(50, Math.ceil(retry * 1000));
+  }
+  const code = err?.code ?? err?.httpStatus;
+  if (code === 429) return 1000;
+  return null;
 }
 
 async function resolveDmChannel(client: any, id: string) {
@@ -200,15 +201,23 @@ async function fetchPage(
   channel: any,
   opts: { limit: number; before?: string; after?: string },
 ) {
-  try {
-    return await channel.messages.fetch(opts);
-  } catch (err: any) {
-    const code = err?.code ?? err?.httpStatus;
-    if (code === 50001 || code === 50013 || code === 403) {
-      throw new Error("Sem permissão para ler mensagens neste canal.");
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      return await channel.messages.fetch(opts);
+    } catch (err: any) {
+      const wait = retryAfterMs(err);
+      if (wait != null) {
+        await sleep(wait);
+        continue;
+      }
+      const code = err?.code ?? err?.httpStatus;
+      if (code === 50001 || code === 50013 || code === 403) {
+        throw new Error("Sem permissão para ler mensagens neste canal.");
+      }
+      throw new Error("Canal do servidor não encontrado.");
     }
-    throw new Error("Canal do servidor não encontrado.");
   }
+  throw new Error("Muitas tentativas. Aguarde e tente novamente.");
 }
 
 function ownFromPage(messages: any, selfId: string): any[] {
@@ -225,28 +234,59 @@ async function deleteOne(
   state: { permissionFailures: number; totalDeleted: number },
 ) {
   if (!msg || msg.author?.id !== selfId) return false;
-  try {
-    await msg.delete();
-    state.totalDeleted += 1;
-    state.permissionFailures = 0;
-    return true;
-  } catch (err: any) {
-    const code = err?.code ?? err?.httpStatus;
-    if (code === 50013 || code === 50001 || code === 403) {
-      state.permissionFailures += 1;
-      if (state.permissionFailures >= 3 && state.totalDeleted === 0) {
-        throw new Error("Sem permissão para apagar mensagens neste canal.");
+
+  for (let attempt = 0; attempt < 8; attempt++) {
+    try {
+      await msg.delete();
+      state.totalDeleted += 1;
+      state.permissionFailures = 0;
+      return true;
+    } catch (err: any) {
+      const wait = retryAfterMs(err);
+      if (wait != null) {
+        await sleep(wait);
+        continue;
       }
+      const code = err?.code ?? err?.httpStatus;
+      if (code === 50013 || code === 50001 || code === 403) {
+        state.permissionFailures += 1;
+        if (state.permissionFailures >= 3 && state.totalDeleted === 0) {
+          throw new Error("Sem permissão para apagar mensagens neste canal.");
+        }
+        return false;
+      }
+      // Unknown/transient — retry briefly once more path
+      if (attempt < 2) {
+        await sleep(150);
+        continue;
+      }
+      return false;
     }
-    return false;
   }
+  return false;
+}
+
+function reportProgress(
+  onProgress: ((info: CleanProgress) => void) | undefined,
+  state: { totalDeleted: number },
+  remainingInBatch: number,
+) {
+  onProgress?.({
+    phase: "deleting",
+    totalDeleted: state.totalDeleted,
+    total: state.totalDeleted + remainingInBatch,
+    remaining: remainingInBatch,
+    percent: Math.min(
+      99,
+      5 + Math.floor(Math.log10(state.totalDeleted + 1) * 30),
+    ),
+  });
 }
 
 /**
  * Deletes ONLY messages authored by the account that owns `token`.
- * Page-by-page: starts deleting without waiting to buffer thousands of messages.
- * - oldest: locate first own message, then delete forward until the end
- * - newest: delete from recent history backward
+ * Starts deleting on the first page — no pre-scan. No artificial delays.
+ * Stops only when the channel history has no more of your messages (or timeout/pause).
  */
 export async function deleteMessagesFromChannel(
   token: string,
@@ -318,6 +358,14 @@ export async function deleteMessagesFromChannel(
 
     await probeChannelReadable(channel);
 
+    onProgress?.({
+      phase: "deleting",
+      totalDeleted: 0,
+      total: 0,
+      remaining: 0,
+      percent: 1,
+    });
+
     if (direction === "oldest") {
       await cleanOldestFirst(channel, selfId, batchSize, {
         throwIfAborted,
@@ -345,7 +393,7 @@ export async function deleteMessagesFromChannel(
       totalDeleted: state.totalDeleted,
       total: state.totalDeleted,
       selfId,
-      partial: false,
+      exhausted: true,
     };
   } finally {
     authToken = null;
@@ -371,7 +419,7 @@ async function cleanNewestFirst(
   let pages = 0;
   const seenCursors = new Set<string>();
 
-  while (pages < MAX_SCAN_PAGES && ctx.state.totalDeleted < MAX_DELETE_MESSAGES) {
+  while (pages < MAX_PAGES_PER_JOB) {
     ctx.throwIfAborted();
     pages += 1;
 
@@ -393,29 +441,13 @@ async function cleanNewestFirst(
 
     for (let i = 0; i < mine.length; i++) {
       ctx.throwIfAborted();
-      if (ctx.state.totalDeleted >= MAX_DELETE_MESSAGES) break;
-
       await deleteOne(mine[i], selfId, ctx.state);
       mine[i] = null;
-
-      ctx.onProgress?.({
-        phase: "deleting",
-        totalDeleted: ctx.state.totalDeleted,
-        total: ctx.state.totalDeleted + (mine.length - i - 1),
-        remaining: Math.max(mine.length - i - 1, 0),
-        percent: Math.min(
-          99,
-          8 + Math.floor(Math.log10(ctx.state.totalDeleted + 1) * 28),
-        ),
-        pagesScanned: pages,
-      });
-
-      await sleep(delayWithJitter(DELETE_DELAY_MS));
+      reportProgress(ctx.onProgress, ctx.state, mine.length - i - 1);
     }
 
     if (messages.size < batchSize) break;
     beforeId = oldestId;
-    await sleep(delayWithJitter(FETCH_DELAY_MS));
   }
 }
 
@@ -429,81 +461,14 @@ async function cleanOldestFirst(
     state: { permissionFailures: number; totalDeleted: number };
   },
 ) {
-  // —— Locate the user's first (oldest) message without buffering all ——
-  let beforeId: string | undefined;
+  // Start at the beginning of channel history (no locate/scan phase)
+  let afterId = "0";
   let pages = 0;
-  let oldestOwnId: string | null = null;
-  const seenCursors = new Set<string>();
-
-  ctx.onProgress?.({
-    phase: "locating",
-    totalDeleted: 0,
-    total: 0,
-    remaining: 0,
-    percent: 1,
-    pagesScanned: 0,
-  });
-
-  while (pages < MAX_SCAN_PAGES) {
-    ctx.throwIfAborted();
-    pages += 1;
-
-    const messages = await fetchPage(channel, {
-      limit: batchSize,
-      before: beforeId,
-    });
-
-    if (!messages || messages.size === 0) break;
-
-    const oldestId = getOldestMessageId(messages);
-    if (!oldestId) break;
-    if (beforeId && oldestId === beforeId) break;
-    if (seenCursors.has(oldestId)) break;
-    seenCursors.add(oldestId);
-
-    for (const msg of messages.values()) {
-      if (msg.author?.id !== selfId) continue;
-      if (!oldestOwnId || BigInt(msg.id) < BigInt(oldestOwnId)) {
-        oldestOwnId = msg.id;
-      }
-    }
-
-    ctx.onProgress?.({
-      phase: "locating",
-      totalDeleted: 0,
-      total: oldestOwnId ? 1 : 0,
-      remaining: 0,
-      percent: Math.min(35, Math.round((pages / Math.max(pages + 5, 20)) * 35)),
-      pagesScanned: pages,
-    });
-
-    if (messages.size < batchSize) break;
-    beforeId = oldestId;
-    await sleep(delayWithJitter(FETCH_DELAY_MS));
-  }
-
-  if (!oldestOwnId) {
-    ctx.onProgress?.({
-      phase: "deleting",
-      totalDeleted: 0,
-      total: 0,
-      remaining: 0,
-      percent: 100,
-    });
-    return;
-  }
-
-  // —— Delete from first own message forward until the end ——
-  let afterId = snowflakeMinusOne(oldestOwnId);
-  let deletePages = 0;
   const seenAfter = new Set<string>();
 
-  while (
-    deletePages < MAX_SCAN_PAGES &&
-    ctx.state.totalDeleted < MAX_DELETE_MESSAGES
-  ) {
+  while (pages < MAX_PAGES_PER_JOB) {
     ctx.throwIfAborted();
-    deletePages += 1;
+    pages += 1;
 
     const messages = await fetchPage(channel, {
       limit: batchSize,
@@ -514,36 +479,20 @@ async function cleanOldestFirst(
 
     const newestId = getNewestMessageId(messages);
     if (!newestId) break;
-    if (seenAfter.has(newestId)) break;
-    seenAfter.add(newestId);
+    if (seenAfter.has(`${afterId}:${newestId}`)) break;
+    seenAfter.add(`${afterId}:${newestId}`);
 
     const mine = ownFromPage(messages, selfId);
     sortByIdAsc(mine);
 
     for (let i = 0; i < mine.length; i++) {
       ctx.throwIfAborted();
-      if (ctx.state.totalDeleted >= MAX_DELETE_MESSAGES) break;
-
       await deleteOne(mine[i], selfId, ctx.state);
       mine[i] = null;
-
-      ctx.onProgress?.({
-        phase: "deleting",
-        totalDeleted: ctx.state.totalDeleted,
-        total: ctx.state.totalDeleted + (mine.length - i - 1),
-        remaining: Math.max(mine.length - i - 1, 0),
-        percent: Math.min(
-          99,
-          40 + Math.floor(Math.log10(ctx.state.totalDeleted + 1) * 22),
-        ),
-        pagesScanned: pages + deletePages,
-      });
-
-      await sleep(delayWithJitter(DELETE_DELAY_MS));
+      reportProgress(ctx.onProgress, ctx.state, mine.length - i - 1);
     }
 
     if (messages.size < batchSize) break;
     afterId = newestId;
-    await sleep(delayWithJitter(FETCH_DELAY_MS));
   }
 }
