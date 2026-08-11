@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import styles from "./cleaner-form.module.css";
 import alertStyles from "./voice-alert-form.module.css";
 
@@ -57,11 +57,36 @@ function formatTime(at: number) {
   }
 }
 
+/** Never allow token/IDs to linger in the address bar. */
+function stripSensitiveQuery() {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  const keys = [
+    "onion-auth",
+    "onion-friend",
+    "onion-friend-id",
+    "token",
+    "userId",
+  ];
+  let dirty = false;
+  for (const key of keys) {
+    if (url.searchParams.has(key)) {
+      url.searchParams.delete(key);
+      dirty = true;
+    }
+  }
+  if (dirty || url.search.length > 0) {
+    // Drop any leftover query on this page — alerts never use query auth
+    window.history.replaceState({}, "", url.pathname);
+  }
+}
+
 export function VoiceAlertForm() {
   const tokenRef = useRef<HTMLInputElement>(null);
   const resumeTokenRef = useRef("");
   const abortRef = useRef<AbortController | null>(null);
-  const autoContinueRef = useRef(true);
+  const autoContinueRef = useRef(false);
+  const runningRef = useRef(false);
 
   const [userId, setUserId] = useState("");
   const [status, setStatus] = useState<Status>({ kind: "idle" });
@@ -69,8 +94,10 @@ export function VoiceAlertForm() {
   const [watchingLabel, setWatchingLabel] = useState("");
 
   useEffect(() => {
+    stripSensitiveQuery();
     return () => {
       autoContinueRef.current = false;
+      runningRef.current = false;
       abortRef.current?.abort("pause");
       resumeTokenRef.current = "";
       clearInput(tokenRef.current);
@@ -79,15 +106,21 @@ export function VoiceAlertForm() {
 
   function stopWatch() {
     autoContinueRef.current = false;
+    runningRef.current = false;
     abortRef.current?.abort("pause");
+    setStatus({ kind: "idle" });
+    setWatchingLabel("");
   }
 
-  async function runWatchBatch(authToken: string, signal: AbortSignal) {
+  async function runWatchBatch(
+    authToken: string,
+    friendId: string,
+    signal: AbortSignal,
+  ): Promise<"stopped" | "partial" | "done"> {
     const csrf = readCookie(CSRF_COOKIE);
-    const body = JSON.stringify({
-      token: authToken,
-      userId: userId.trim(),
-    });
+    if (!csrf) {
+      throw new Error("Sessão inválida. Recarregue a página.");
+    }
 
     const response = await fetch("/api/voice-watch", {
       method: "POST",
@@ -98,7 +131,10 @@ export function VoiceAlertForm() {
       },
       cache: "no-store",
       credentials: "same-origin",
-      body,
+      body: JSON.stringify({
+        token: authToken,
+        userId: friendId,
+      }),
       signal,
     });
 
@@ -118,7 +154,8 @@ export function VoiceAlertForm() {
     const reader = response.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
-    let outcome: "stopped" | "partial" | "done" | "error" = "done";
+    let outcome: "stopped" | "partial" | "done" = "done";
+    let sawReady = false;
 
     while (true) {
       const { done, value } = await reader.read();
@@ -137,13 +174,18 @@ export function VoiceAlertForm() {
           continue;
         }
 
+        if (event.type === "start") {
+          setWatchingLabel("Conectando ao Discord…");
+        }
+
         if (event.type === "ready") {
+          sawReady = true;
           if (tokenRef.current) tokenRef.current.value = "";
           if (event.alreadyInCall === true) {
             setWatchingLabel("Amigo já está em call — observando mudanças");
           } else {
             setWatchingLabel(
-              "Ainda não está em call — observando em tempo real…",
+              "Alerta ativo — aguardando o amigo entrar em call…",
             );
           }
         }
@@ -168,7 +210,6 @@ export function VoiceAlertForm() {
             at: typeof event.at === "number" ? event.at : Date.now(),
           };
           setAlerts((prev) => {
-            // avoid duplicate "already" for same channel
             if (
               item.kind === "already" &&
               prev.some(
@@ -212,7 +253,6 @@ export function VoiceAlertForm() {
         if (event.type === "partial") outcome = "partial";
         if (event.type === "done") outcome = "done";
         if (event.type === "error") {
-          outcome = "error";
           throw new Error(
             typeof event.error === "string" ? event.error : SAFE_ERROR,
           );
@@ -220,19 +260,35 @@ export function VoiceAlertForm() {
       }
     }
 
+    if (!sawReady && outcome === "done") {
+      throw new Error("Não foi possível iniciar o alerta. Tente novamente.");
+    }
+
     return outcome;
   }
 
-  function restoreTokenToInput(authToken: string) {
-    resumeTokenRef.current = authToken;
-    if (tokenRef.current) tokenRef.current.value = authToken;
-  }
+  async function startWatch() {
+    if (runningRef.current) return;
 
-  async function startWatch(authToken: string) {
+    const authToken =
+      tokenRef.current?.value.trim() || resumeTokenRef.current;
+    const friendId = userId.trim();
+
+    if (!authToken || !friendId) {
+      setStatus({
+        kind: "error",
+        message: "Preencha o token e o ID do usuário.",
+      });
+      return;
+    }
+
+    stripSensitiveQuery();
     resumeTokenRef.current = authToken;
     autoContinueRef.current = true;
+    runningRef.current = true;
     setStatus({ kind: "watching" });
     setWatchingLabel("Conectando…");
+    setAlerts([]);
 
     if (
       typeof Notification !== "undefined" &&
@@ -245,57 +301,49 @@ export function VoiceAlertForm() {
       }
     }
 
-    let connected = false;
-
     try {
-      for (let round = 0; round < 200 && autoContinueRef.current; round++) {
+      while (autoContinueRef.current && runningRef.current) {
         const abort = new AbortController();
         abortRef.current = abort;
-        const outcome = await runWatchBatch(authToken, abort.signal);
+
+        let outcome: "stopped" | "partial" | "done";
+        try {
+          outcome = await runWatchBatch(authToken, friendId, abort.signal);
+        } catch (err) {
+          abortRef.current = null;
+          if (err instanceof DOMException && err.name === "AbortError") {
+            break;
+          }
+          throw err;
+        }
+
         abortRef.current = null;
 
-        if (outcome === "partial" || outcome === "done") {
-          connected = true;
-        }
-
-        if (!autoContinueRef.current) {
-          setStatus({ kind: "idle" });
-          setWatchingLabel("");
-          break;
-        }
+        if (!autoContinueRef.current || !runningRef.current) break;
 
         if (outcome === "stopped") {
-          // Unexpected stop from server — keep token so user can retry
-          restoreTokenToInput(authToken);
-          setStatus({ kind: "idle" });
-          setWatchingLabel("");
+          // Replaced/stopped unexpectedly — leave idle with token restored
           break;
         }
-        if (outcome === "partial") {
+
+        if (outcome === "partial" || outcome === "done") {
           setWatchingLabel("Reconectando observação…");
           continue;
         }
-        if (autoContinueRef.current) {
-          setWatchingLabel("Reconectando observação…");
-          continue;
-        }
-        setStatus({ kind: "idle" });
-        break;
+      }
+
+      if (tokenRef.current && !tokenRef.current.value) {
+        tokenRef.current.value = authToken;
+      }
+      setStatus({ kind: "idle" });
+      if (!autoContinueRef.current) {
+        setWatchingLabel("");
+      } else {
+        setWatchingLabel("");
       }
     } catch (err) {
-      abortRef.current = null;
-      if (err instanceof DOMException && err.name === "AbortError") {
-        if (!autoContinueRef.current) {
-          setStatus({ kind: "idle" });
-          setWatchingLabel("");
-          return;
-        }
-        restoreTokenToInput(authToken);
-        setStatus({ kind: "idle" });
-        setWatchingLabel("");
-        return;
-      }
-      restoreTokenToInput(authToken);
+      if (tokenRef.current) tokenRef.current.value = authToken;
+      resumeTokenRef.current = authToken;
       setStatus({
         kind: "error",
         message:
@@ -305,49 +353,28 @@ export function VoiceAlertForm() {
       });
       setWatchingLabel("");
     } finally {
-      if (!connected && tokenRef.current && !tokenRef.current.value) {
-        restoreTokenToInput(authToken);
-      }
+      runningRef.current = false;
+      abortRef.current = null;
     }
-  }
-
-  async function onSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const fromInput = tokenRef.current?.value.trim() ?? "";
-    const authToken = fromInput || resumeTokenRef.current;
-    if (!authToken || !userId.trim()) {
-      setStatus({
-        kind: "error",
-        message: "Preencha o token e o ID do usuário.",
-      });
-      return;
-    }
-    await startWatch(authToken);
   }
 
   const isWatching = status.kind === "watching";
   const fieldsLocked = isWatching;
 
   return (
-    <form
-      className={styles.form}
-      onSubmit={onSubmit}
-      autoComplete="off"
-      data-form-type="other"
-    >
+    <div className={styles.form}>
       <label className={styles.field}>
         <span className={styles.label}>Token da sua conta</span>
         <input
           ref={tokenRef}
           className={styles.input}
           type="password"
-          name="onion-auth"
+          // no name → never appears in URL if something submits
           autoComplete="off"
           autoCapitalize="off"
           autoCorrect="off"
           spellCheck={false}
           placeholder="Cole o token aqui"
-          required={!resumeTokenRef.current}
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
@@ -360,7 +387,6 @@ export function VoiceAlertForm() {
         <input
           className={styles.input}
           type="text"
-          name="onion-friend"
           inputMode="numeric"
           autoComplete="off"
           autoCapitalize="off"
@@ -369,7 +395,6 @@ export function VoiceAlertForm() {
           placeholder="ID do usuário do Discord"
           value={userId}
           onChange={(e) => setUserId(e.target.value.replace(/\D/g, ""))}
-          required
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
@@ -379,7 +404,11 @@ export function VoiceAlertForm() {
 
       <div className={styles.actions}>
         {!isWatching ? (
-          <button className={styles.submit} type="submit">
+          <button
+            className={styles.submit}
+            type="button"
+            onClick={() => void startWatch()}
+          >
             Começar alerta
           </button>
         ) : (
@@ -411,12 +440,8 @@ export function VoiceAlertForm() {
               <p className={alertStyles.title}>
                 {item.username || "Amigo"} · {item.channelName}
               </p>
-              <p className={alertStyles.meta}>
-                Servidor: {item.guildName}
-              </p>
-              <p className={alertStyles.meta}>
-                Canal: {item.channelName}
-              </p>
+              <p className={alertStyles.meta}>Servidor: {item.guildName}</p>
+              <p className={alertStyles.meta}>Canal: {item.channelName}</p>
             </article>
           ))}
         </div>
@@ -427,6 +452,6 @@ export function VoiceAlertForm() {
           <p className={styles.error}>{status.message}</p>
         )}
       </div>
-    </form>
+    </div>
   );
 }
