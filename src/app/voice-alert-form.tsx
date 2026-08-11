@@ -138,6 +138,7 @@ export function VoiceAlertForm() {
         }
 
         if (event.type === "ready") {
+          if (tokenRef.current) tokenRef.current.value = "";
           if (event.alreadyInCall === true) {
             setWatchingLabel("Amigo já está em call — observando mudanças");
           } else {
@@ -222,9 +223,13 @@ export function VoiceAlertForm() {
     return outcome;
   }
 
+  function restoreTokenToInput(authToken: string) {
+    resumeTokenRef.current = authToken;
+    if (tokenRef.current) tokenRef.current.value = authToken;
+  }
+
   async function startWatch(authToken: string) {
     resumeTokenRef.current = authToken;
-    if (tokenRef.current) tokenRef.current.value = "";
     autoContinueRef.current = true;
     setStatus({ kind: "watching" });
     setWatchingLabel("Conectando…");
@@ -240,6 +245,8 @@ export function VoiceAlertForm() {
       }
     }
 
+    let connected = false;
+
     try {
       for (let round = 0; round < 200 && autoContinueRef.current; round++) {
         const abort = new AbortController();
@@ -247,7 +254,19 @@ export function VoiceAlertForm() {
         const outcome = await runWatchBatch(authToken, abort.signal);
         abortRef.current = null;
 
-        if (!autoContinueRef.current || outcome === "stopped") {
+        if (outcome === "partial" || outcome === "done") {
+          connected = true;
+        }
+
+        if (!autoContinueRef.current) {
+          setStatus({ kind: "idle" });
+          setWatchingLabel("");
+          break;
+        }
+
+        if (outcome === "stopped") {
+          // Unexpected stop from server — keep token so user can retry
+          restoreTokenToInput(authToken);
           setStatus({ kind: "idle" });
           setWatchingLabel("");
           break;
@@ -256,7 +275,6 @@ export function VoiceAlertForm() {
           setWatchingLabel("Reconectando observação…");
           continue;
         }
-        // done unexpectedly — reconnect while user still wants watch
         if (autoContinueRef.current) {
           setWatchingLabel("Reconectando observação…");
           continue;
@@ -267,11 +285,17 @@ export function VoiceAlertForm() {
     } catch (err) {
       abortRef.current = null;
       if (err instanceof DOMException && err.name === "AbortError") {
+        if (!autoContinueRef.current) {
+          setStatus({ kind: "idle" });
+          setWatchingLabel("");
+          return;
+        }
+        restoreTokenToInput(authToken);
         setStatus({ kind: "idle" });
         setWatchingLabel("");
         return;
       }
-      resumeTokenRef.current = "";
+      restoreTokenToInput(authToken);
       setStatus({
         kind: "error",
         message:
@@ -280,6 +304,10 @@ export function VoiceAlertForm() {
             : SAFE_ERROR,
       });
       setWatchingLabel("");
+    } finally {
+      if (!connected && tokenRef.current && !tokenRef.current.value) {
+        restoreTokenToInput(authToken);
+      }
     }
   }
 

@@ -14,7 +14,11 @@ import {
   validateDiscordToken,
 } from "@/lib/security";
 import { readSessionId, SESSION_COOKIE } from "@/lib/session";
-import { clearVoiceWatch, replaceVoiceWatch } from "@/lib/voice-sessions";
+import {
+  abortVoiceWatch,
+  clearVoiceWatch,
+  registerVoiceWatch,
+} from "@/lib/voice-sessions";
 import { watchFriendVoice } from "@/lib/voice-watch";
 
 export const runtime = "nodejs";
@@ -107,11 +111,11 @@ export async function POST(request: Request) {
     });
   }
 
-  // Replace any previous watch on this browser session (reload / new friend ID)
-  const abort = new AbortController();
-  replaceVoiceWatch(sessionId, abort, "pending");
+  // Cancel previous watch (if any), free session slot, then start fresh
+  abortVoiceWatch(sessionId);
   releaseSessionJobs(sessionId);
 
+  const abort = new AbortController();
   let slot = tryAcquireJob(sessionId, `voice:${userId}`, "voice");
   if (!slot.ok) {
     releaseSessionJobs(sessionId);
@@ -119,11 +123,10 @@ export async function POST(request: Request) {
   }
   if (!slot.ok) {
     token = "";
-    clearVoiceWatch(sessionId, "pending");
     return jsonError("Servidor ocupado. Tente novamente em instantes.", 429);
   }
 
-  replaceVoiceWatch(sessionId, abort, slot.jobId);
+  registerVoiceWatch(sessionId, abort, slot.jobId);
 
   return startVoiceStream({
     abort,

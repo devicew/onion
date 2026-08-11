@@ -10,20 +10,24 @@ type VoiceWatchSlot = {
 
 const activeBySession = new Map<string, VoiceWatchSlot>();
 
-/** Cancels any previous watch for this session, then registers the new one. */
-export function replaceVoiceWatch(
+/** Stop whatever watch is running for this session (if any). */
+export function abortVoiceWatch(sessionId: string): void {
+  const prev = activeBySession.get(sessionId);
+  if (!prev) return;
+  activeBySession.delete(sessionId);
+  try {
+    prev.abort.abort("replaced");
+  } catch {
+    // ignore
+  }
+}
+
+/** Register the active watch for this session (does not abort itself). */
+export function registerVoiceWatch(
   sessionId: string,
   abort: AbortController,
   jobId: string,
 ): void {
-  const prev = activeBySession.get(sessionId);
-  if (prev) {
-    try {
-      prev.abort.abort("replaced");
-    } catch {
-      // ignore
-    }
-  }
   activeBySession.set(sessionId, { abort, jobId });
 }
 
