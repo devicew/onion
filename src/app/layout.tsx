@@ -1,6 +1,5 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
-import { headers } from "next/headers";
 import { ConsoleGuard } from "./console-guard";
 import "./globals.css";
 
@@ -64,17 +63,14 @@ export const metadata: Metadata = {
   },
 };
 
-export default async function RootLayout({
+export default function RootLayout({
   children,
 }: Readonly<{
   children: React.ReactNode;
 }>) {
-  const headerStore = await headers();
-  const nonce = headerStore.get("x-nonce") ?? undefined;
-
   return (
     <html lang="pt-BR" className={poppins.variable}>
-      <body nonce={nonce}>
+      <body>
         <ConsoleGuard />
         {children}
       </body>

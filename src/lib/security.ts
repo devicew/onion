@@ -154,10 +154,10 @@ export function safeClientError(err: unknown): string {
   const cleaned = redactSecrets(raw).trim();
 
   if (/^PAUSADO$/i.test(cleaned)) {
-    return "Limpeza pausada.";
+    return "Operação pausada.";
   }
   if (/^TEMPO_LIMITE$/i.test(cleaned)) {
-    return "Tempo da sessão esgotado. Continue para seguir apagando.";
+    return "Tempo da sessão esgotado.";
   }
 
   const known: Array<[RegExp, string]> = [

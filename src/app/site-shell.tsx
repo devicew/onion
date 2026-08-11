@@ -1,7 +1,7 @@
 import Link from "next/link";
 import styles from "./page.module.css";
 
-type ToolId = "dm" | "servidor";
+type ToolId = "dm" | "servidor" | "alerta";
 
 type SiteShellProps = {
   children: React.ReactNode;

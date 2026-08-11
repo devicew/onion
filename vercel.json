@@ -6,6 +6,10 @@
     "src/app/api/clean/route.ts": {
       "maxDuration": 300,
       "memory": 1024
+    },
+    "src/app/api/voice-watch/route.ts": {
+      "maxDuration": 300,
+      "memory": 1024
     }
   },
   "headers": [

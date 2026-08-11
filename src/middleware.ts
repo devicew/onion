@@ -22,9 +22,15 @@ const securityHeaders: Record<string, string> = {
 };
 
 function buildCsp(nonce: string, isDev: boolean): string {
+  // Dev: allow Turbopack/HMR without nonce (nonce on <body> also caused hydration mismatch).
+  // Prod: nonce + strict-dynamic on scripts.
   const scriptSrc = isDev
-    ? `script-src 'self' 'nonce-${nonce}' 'strict-dynamic' 'unsafe-eval'`
+    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
     : `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`;
+
+  const connectSrc = isDev
+    ? "connect-src 'self' ws: wss: http: https:"
+    : "connect-src 'self'";
 
   return [
     "default-src 'self'",
@@ -32,12 +38,12 @@ function buildCsp(nonce: string, isDev: boolean): string {
     "style-src 'self' 'unsafe-inline'",
     "img-src 'self' data:",
     "font-src 'self'",
-    "connect-src 'self'",
+    connectSrc,
     "object-src 'none'",
     "base-uri 'self'",
     "form-action 'self'",
     "frame-ancestors 'none'",
-    "upgrade-insecure-requests",
+    ...(isDev ? [] : ["upgrade-insecure-requests"]),
   ].join("; ");
 }
 

@@ -3,7 +3,7 @@ import { SiteShell } from "../site-shell";
 import styles from "../page.module.css";
 import optionStyles from "./opcoes.module.css";
 
-type ToolId = "dm" | "servidor";
+type ToolId = "dm" | "servidor" | "alerta";
 
 const OPTIONS: Array<{
   id: ToolId;
@@ -24,6 +24,13 @@ const OPTIONS: Array<{
     description:
       "Limpe suas mensagens em canal de texto ou no chat de um canal de voz.",
   },
+  {
+    id: "alerta",
+    href: "/alerta",
+    title: "Alerta de call",
+    description:
+      "Receba aviso quando um amigo entrar em um canal de voz para entrar junto.",
+  },
 ];
 
 export default async function OpcoesPage({
@@ -33,12 +40,18 @@ export default async function OpcoesPage({
 }) {
   const params = await searchParams;
   const atual =
-    params.atual === "servidor" || params.atual === "dm"
+    params.atual === "servidor" ||
+    params.atual === "dm" ||
+    params.atual === "alerta"
       ? params.atual
       : undefined;
 
   const backHref =
-    atual === "servidor" ? "/servidor" : atual === "dm" ? "/" : "/";
+    atual === "servidor"
+      ? "/servidor"
+      : atual === "alerta"
+        ? "/alerta"
+        : "/";
 
   return (
     <SiteShell moreHref={backHref} moreLabel="Voltar">
