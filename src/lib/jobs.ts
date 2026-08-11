@@ -78,3 +78,10 @@ export function releaseJob(jobId: string): void {
   if (current <= 1) sessionLocalCount.delete(job.sessionId);
   else sessionLocalCount.set(job.sessionId, current - 1);
 }
+
+/** Drop every in-memory job for a browser session (e.g. replace voice watch). */
+export function releaseSessionJobs(sessionId: string): void {
+  for (const [id, job] of [...localJobs.entries()]) {
+    if (job.sessionId === sessionId) releaseJob(id);
+  }
+}

@@ -1,4 +1,4 @@
-import { releaseJob, tryAcquireJob } from "@/lib/jobs";
+import { releaseJob, releaseSessionJobs, tryAcquireJob } from "@/lib/jobs";
 import { logJob } from "@/lib/logger";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import {
@@ -14,6 +14,7 @@ import {
   validateDiscordToken,
 } from "@/lib/security";
 import { readSessionId, SESSION_COOKIE } from "@/lib/session";
+import { clearVoiceWatch, replaceVoiceWatch } from "@/lib/voice-sessions";
 import { watchFriendVoice } from "@/lib/voice-watch";
 
 export const runtime = "nodejs";
@@ -106,20 +107,48 @@ export async function POST(request: Request) {
     });
   }
 
-  const slot = tryAcquireJob(sessionId, `voice:${userId}`, "voice");
+  // Replace any previous watch on this browser session (reload / new friend ID)
+  const abort = new AbortController();
+  replaceVoiceWatch(sessionId, abort, "pending");
+  releaseSessionJobs(sessionId);
+
+  let slot = tryAcquireJob(sessionId, `voice:${userId}`, "voice");
+  if (!slot.ok) {
+    releaseSessionJobs(sessionId);
+    slot = tryAcquireJob(sessionId, `voice:${userId}`, "voice");
+  }
   if (!slot.ok) {
     token = "";
-    return jsonError(
-      "Já existe um alerta em andamento nesta sessão (ou o servidor está ocupado).",
-      429,
-    );
+    clearVoiceWatch(sessionId, "pending");
+    return jsonError("Servidor ocupado. Tente novamente em instantes.", 429);
   }
 
-  const abort = new AbortController();
+  replaceVoiceWatch(sessionId, abort, slot.jobId);
+
+  return startVoiceStream({
+    abort,
+    jobId: slot.jobId,
+    token,
+    userId,
+    sessionId,
+    startedAt,
+  });
+}
+
+function startVoiceStream(args: {
+  abort: AbortController;
+  jobId: string;
+  token: string;
+  userId: string;
+  sessionId: string;
+  startedAt: number;
+}) {
+  const { abort, jobId, userId, sessionId, startedAt } = args;
+  let token = args.token;
   const timeout = setTimeout(() => abort.abort("timeout"), 290_000);
 
   logJob({
-    jobId: slot.jobId,
+    jobId,
     status: "start",
     mode: "voice",
   });
@@ -163,7 +192,7 @@ export async function POST(request: Request) {
 
         controller.enqueue(encode({ type: "done" }));
         logJob({
-          jobId: slot.jobId,
+          jobId,
           status: "done",
           mode: "voice",
           durationMs: Date.now() - startedAt,
@@ -173,7 +202,7 @@ export async function POST(request: Request) {
         if (raw === "PAUSADO") {
           controller.enqueue(encode({ type: "stopped" }));
           logJob({
-            jobId: slot.jobId,
+            jobId,
             status: "done",
             mode: "voice",
             durationMs: Date.now() - startedAt,
@@ -182,7 +211,7 @@ export async function POST(request: Request) {
         } else if (raw === "TEMPO_LIMITE") {
           controller.enqueue(encode({ type: "partial" }));
           logJob({
-            jobId: slot.jobId,
+            jobId,
             status: "done",
             mode: "voice",
             durationMs: Date.now() - startedAt,
@@ -193,7 +222,7 @@ export async function POST(request: Request) {
             encode({ type: "error", error: safeClientError(err) }),
           );
           logJob({
-            jobId: slot.jobId,
+            jobId,
             status: "error",
             mode: "voice",
             durationMs: Date.now() - startedAt,
@@ -203,14 +232,16 @@ export async function POST(request: Request) {
       } finally {
         authToken = null;
         clearTimeout(timeout);
-        releaseJob(slot.jobId);
+        clearVoiceWatch(sessionId, jobId);
+        releaseJob(jobId);
         controller.close();
       }
     },
     cancel() {
       abort.abort("pause");
       clearTimeout(timeout);
-      releaseJob(slot.jobId);
+      clearVoiceWatch(sessionId, jobId);
+      releaseJob(jobId);
     },
   });
 
