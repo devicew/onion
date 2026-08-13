@@ -66,12 +66,13 @@
 
 .directionChips {
   position: absolute;
-  top: -1.7cm;
+  top: 0.05rem;
   right: 0;
-  z-index: 2;
+  z-index: 5;
   display: inline-flex;
   align-items: center;
   gap: 0.3rem;
+  pointer-events: auto;
 }
 
 .directionChip {

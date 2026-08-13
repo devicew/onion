@@ -21,12 +21,13 @@ const securityHeaders: Record<string, string> = {
   "X-DNS-Prefetch-Control": "off",
 };
 
-function buildCsp(nonce: string, isDev: boolean): string {
-  // Dev: allow Turbopack/HMR without nonce (nonce on <body> also caused hydration mismatch).
-  // Prod: nonce + strict-dynamic on scripts.
+function buildCsp(_nonce: string, isDev: boolean): string {
+  // Next.js App Router needs inline scripts for hydration.
+  // Nonce-only CSP without wiring nonce onto every Next script blocks React
+  // and makes all type="button" clicks do nothing in production.
   const scriptSrc = isDev
     ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
-    : `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`;
+    : "script-src 'self' 'unsafe-inline'";
 
   const connectSrc = isDev
     ? "connect-src 'self' ws: wss: http: https:"

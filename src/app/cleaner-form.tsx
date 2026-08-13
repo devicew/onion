@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import styles from "./cleaner-form.module.css";
 
 export type CleanMode = "dm" | "guild";
@@ -363,8 +363,14 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const isPaused = status.kind === "paused";
   const fieldsLocked = isLoading || isSuccess;
 
+  function onSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (fieldsLocked || isPaused) return;
+    void startClean();
+  }
+
   return (
-    <div className={styles.form}>
+    <form className={styles.form} onSubmit={onSubmit} noValidate>
       <div
         className={styles.directionChips}
         role="radiogroup"
@@ -451,9 +457,8 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         {!isPaused && (
           <button
             className={`${styles.submit} ${isSuccess ? styles.submitSuccess : ""}`}
-            type="button"
+            type="submit"
             disabled={fieldsLocked}
-            onClick={() => void startClean()}
           >
             <span className={styles.submitInner}>
               {isSuccess && (
@@ -552,6 +557,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           <p className={styles.error}>{status.message}</p>
         )}
       </div>
-    </div>
+    </form>
   );
 }
