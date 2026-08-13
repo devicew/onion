@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import styles from "./cleaner-form.module.css";
 
 export type CleanMode = "dm" | "guild";
@@ -48,12 +48,28 @@ function clearInput(input: HTMLInputElement | null) {
   input.value = "";
 }
 
+function stripSensitiveQuery() {
+  if (typeof window === "undefined") return;
+  const url = new URL(window.location.href);
+  const keys = ["onion-auth", "onion-channel", "token", "channelId"];
+  let dirty = false;
+  for (const key of keys) {
+    if (url.searchParams.has(key)) {
+      url.searchParams.delete(key);
+      dirty = true;
+    }
+  }
+  if (dirty) {
+    window.history.replaceState({}, "", `${url.pathname}${url.hash}`);
+  }
+}
+
 export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const tokenRef = useRef<HTMLInputElement>(null);
-  /** Kept only while a job can be resumed (pause / timeout). Cleared on success/unmount. */
   const resumeTokenRef = useRef<string>("");
   const abortRef = useRef<AbortController | null>(null);
   const sessionDeletedRef = useRef(0);
+  const runningRef = useRef(false);
 
   const [channelId, setChannelId] = useState("");
   const [direction, setDirection] = useState<CleanDirection>("oldest");
@@ -62,10 +78,12 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const isGuild = mode === "guild";
 
   useEffect(() => {
+    stripSensitiveQuery();
     const tokenInput = tokenRef.current;
     return () => {
       if (successTimerRef.current) clearTimeout(successTimerRef.current);
       abortRef.current?.abort("pause");
+      runningRef.current = false;
       resumeTokenRef.current = "";
       clearInput(tokenInput);
     };
@@ -77,195 +95,176 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
 
   async function runCleanBatch(
     authToken: string,
+    targetChannelId: string,
     signal: AbortSignal,
   ): Promise<RunOutcome> {
-    const targetChannelId = channelId.trim();
     const csrf = readCookie(CSRF_COOKIE);
-    let requestBody: string | null = JSON.stringify({
-      token: authToken,
-      channelId: targetChannelId,
-      mode,
-      direction,
-    });
-
-    try {
-      const response = await fetch("/api/clean", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/x-ndjson",
-          [CSRF_HEADER]: csrf,
-        },
-        cache: "no-store",
-        credentials: "same-origin",
-        body: requestBody,
-        signal,
-      });
-
-      requestBody = null;
-
-      if (!response.ok || !response.body) {
-        let message = SAFE_ERROR;
-        try {
-          const data = await response.json();
-          if (typeof data?.error === "string" && data.error.length < 120) {
-            message = data.error;
-          }
-        } catch {
-          // keep default
-        }
-        resumeTokenRef.current = "";
-        setStatus({ kind: "error", message });
-        return "error";
-      }
-
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = "";
-      let outcome: RunOutcome | null = null;
-      let lastDeleted = sessionDeletedRef.current;
-      let batchBase = sessionDeletedRef.current;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split("\n");
-        buffer = lines.pop() || "";
-
-        for (const line of lines) {
-          if (!line.trim()) continue;
-
-          let event: {
-            type?: string;
-            totalDeleted?: number;
-            percent?: number;
-            error?: string;
-          };
-
-          try {
-            event = JSON.parse(line);
-          } catch {
-            continue;
-          }
-
-          if (event.type === "progress") {
-            const batchDeleted = event.totalDeleted ?? 0;
-            const totalDeleted = batchBase + batchDeleted;
-            lastDeleted = totalDeleted;
-            const percent = Math.max(
-              0,
-              Math.min(
-                99,
-                typeof event.percent === "number" ? event.percent : 0,
-              ),
-            );
-            setStatus({ kind: "loading", percent, totalDeleted });
-          }
-
-          if (event.type === "done") {
-            const batchDeleted = event.totalDeleted ?? 0;
-            lastDeleted = batchBase + batchDeleted;
-            outcome = "done";
-          }
-
-          if (event.type === "paused") {
-            sessionDeletedRef.current = lastDeleted;
-            outcome = "paused";
-          }
-
-          if (event.type === "partial") {
-            sessionDeletedRef.current = lastDeleted;
-            outcome = "partial";
-          }
-
-          if (event.type === "error") {
-            resumeTokenRef.current = "";
-            sessionDeletedRef.current = 0;
-            setStatus({
-              kind: "error",
-              message:
-                typeof event.error === "string" && event.error.length < 120
-                  ? event.error
-                  : SAFE_ERROR,
-            });
-            outcome = "error";
-          }
-        }
-      }
-
-      if (outcome === "done") {
-        sessionDeletedRef.current = 0;
-        resumeTokenRef.current = "";
-        setStatus({
-          kind: "success",
-          percent: 100,
-          totalDeleted: lastDeleted,
-          total: lastDeleted,
-        });
-        if (successTimerRef.current) clearTimeout(successTimerRef.current);
-        successTimerRef.current = setTimeout(() => {
-          setStatus({ kind: "idle" });
-          successTimerRef.current = null;
-        }, SUCCESS_VISIBLE_MS);
-        return "done";
-      }
-
-      if (outcome === "paused") {
-        setStatus({
-          kind: "paused",
-          totalDeleted: lastDeleted,
-          message: "Limpeza pausada. Clique em Continuar para retomar.",
-        });
-        return "paused";
-      }
-
-      if (outcome === "partial") {
-        setStatus({
-          kind: "loading",
-          percent: 99,
-          totalDeleted: lastDeleted,
-        });
-        return "partial";
-      }
-
-      if (outcome === "error") return "error";
-
-      if (signal.aborted) {
-        sessionDeletedRef.current = lastDeleted;
-        setStatus({
-          kind: "paused",
-          totalDeleted: lastDeleted,
-          message: "Limpeza pausada. Clique em Continuar para retomar.",
-        });
-        return "paused";
-      }
-
-      resumeTokenRef.current = "";
-      setStatus({ kind: "error", message: SAFE_ERROR });
-      return "error";
-    } catch (err) {
-      requestBody = null;
-      if (err instanceof DOMException && err.name === "AbortError") {
-        setStatus({
-          kind: "paused",
-          totalDeleted: sessionDeletedRef.current,
-          message: "Limpeza pausada. Clique em Continuar para retomar.",
-        });
-        return "paused";
-      }
-      resumeTokenRef.current = "";
+    if (!csrf) {
       setStatus({
         kind: "error",
-        message: "Falha de conexão com o servidor.",
+        message: "Sessão inválida. Recarregue a página.",
       });
       return "error";
     }
+
+    const response = await fetch("/api/clean", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/x-ndjson",
+        [CSRF_HEADER]: csrf,
+      },
+      cache: "no-store",
+      credentials: "same-origin",
+      body: JSON.stringify({
+        token: authToken,
+        channelId: targetChannelId,
+        mode,
+        direction,
+      }),
+      signal,
+    });
+
+    if (!response.ok || !response.body) {
+      let message = SAFE_ERROR;
+      try {
+        const data = await response.json();
+        if (typeof data?.error === "string" && data.error.length < 120) {
+          message = data.error;
+        }
+      } catch {
+        // keep default
+      }
+      setStatus({ kind: "error", message });
+      return "error";
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let outcome: RunOutcome | null = null;
+    let lastDeleted = sessionDeletedRef.current;
+    const batchBase = sessionDeletedRef.current;
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (!line.trim()) continue;
+
+        let event: {
+          type?: string;
+          totalDeleted?: number;
+          percent?: number;
+          error?: string;
+        };
+
+        try {
+          event = JSON.parse(line);
+        } catch {
+          continue;
+        }
+
+        if (event.type === "progress") {
+          const batchDeleted = event.totalDeleted ?? 0;
+          const totalDeleted = batchBase + batchDeleted;
+          lastDeleted = totalDeleted;
+          const percent = Math.max(
+            0,
+            Math.min(99, typeof event.percent === "number" ? event.percent : 0),
+          );
+          setStatus({ kind: "loading", percent, totalDeleted });
+        }
+
+        if (event.type === "done") {
+          const batchDeleted = event.totalDeleted ?? 0;
+          lastDeleted = batchBase + batchDeleted;
+          outcome = "done";
+        }
+
+        if (event.type === "paused") {
+          sessionDeletedRef.current = lastDeleted;
+          outcome = "paused";
+        }
+
+        if (event.type === "partial") {
+          sessionDeletedRef.current = lastDeleted;
+          outcome = "partial";
+        }
+
+        if (event.type === "error") {
+          setStatus({
+            kind: "error",
+            message:
+              typeof event.error === "string" && event.error.length < 120
+                ? event.error
+                : SAFE_ERROR,
+          });
+          outcome = "error";
+        }
+      }
+    }
+
+    if (outcome === "done") {
+      sessionDeletedRef.current = 0;
+      resumeTokenRef.current = "";
+      clearInput(tokenRef.current);
+      setStatus({
+        kind: "success",
+        percent: 100,
+        totalDeleted: lastDeleted,
+        total: lastDeleted,
+      });
+      if (successTimerRef.current) clearTimeout(successTimerRef.current);
+      successTimerRef.current = setTimeout(() => {
+        setStatus({ kind: "idle" });
+        successTimerRef.current = null;
+      }, SUCCESS_VISIBLE_MS);
+      return "done";
+    }
+
+    if (outcome === "paused") {
+      setStatus({
+        kind: "paused",
+        totalDeleted: lastDeleted,
+        message: "Limpeza pausada. Clique em Continuar para retomar.",
+      });
+      return "paused";
+    }
+
+    if (outcome === "partial") {
+      setStatus({
+        kind: "loading",
+        percent: 99,
+        totalDeleted: lastDeleted,
+      });
+      return "partial";
+    }
+
+    if (outcome === "error") return "error";
+
+    if (signal.aborted) {
+      sessionDeletedRef.current = lastDeleted;
+      setStatus({
+        kind: "paused",
+        totalDeleted: lastDeleted,
+        message: "Limpeza pausada. Clique em Continuar para retomar.",
+      });
+      return "paused";
+    }
+
+    setStatus({ kind: "error", message: SAFE_ERROR });
+    return "error";
   }
 
-  /** Keeps going automatically until history is exhausted (or user pauses). */
   async function runClean(authToken: string) {
+    if (runningRef.current) return;
+
     if (successTimerRef.current) {
       clearTimeout(successTimerRef.current);
       successTimerRef.current = null;
@@ -277,8 +276,9 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
       return;
     }
 
+    stripSensitiveQuery();
     resumeTokenRef.current = authToken;
-    if (tokenRef.current) tokenRef.current.value = "";
+    runningRef.current = true;
 
     setStatus({
       kind: "loading",
@@ -286,29 +286,54 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
       totalDeleted: sessionDeletedRef.current,
     });
 
-    // Auto-continue across serverless time limits until finished
-    for (let round = 0; round < 500; round++) {
-      const abort = new AbortController();
-      abortRef.current = abort;
+    try {
+      for (let round = 0; round < 500; round++) {
+        const abort = new AbortController();
+        abortRef.current = abort;
 
-      const outcome = await runCleanBatch(authToken, abort.signal);
-      abortRef.current = null;
+        let outcome: RunOutcome;
+        try {
+          outcome = await runCleanBatch(
+            authToken,
+            targetChannelId,
+            abort.signal,
+          );
+        } catch (err) {
+          abortRef.current = null;
+          if (err instanceof DOMException && err.name === "AbortError") {
+            setStatus({
+              kind: "paused",
+              totalDeleted: sessionDeletedRef.current,
+              message: "Limpeza pausada. Clique em Continuar para retomar.",
+            });
+            break;
+          }
+          if (tokenRef.current) tokenRef.current.value = authToken;
+          setStatus({
+            kind: "error",
+            message: "Falha de conexão com o servidor.",
+          });
+          break;
+        }
 
-      if (outcome === "partial") {
-        // Seamless restart — no user click
-        continue;
+        abortRef.current = null;
+
+        if (outcome === "partial") continue;
+        if (outcome === "error" && tokenRef.current && !tokenRef.current.value) {
+          tokenRef.current.value = authToken;
+        }
+        break;
       }
-      break;
+    } finally {
+      runningRef.current = false;
+      abortRef.current = null;
     }
   }
 
-  async function onSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-
+  async function startClean() {
     const fromInput = tokenRef.current?.value.trim() ?? "";
     const authToken = fromInput || resumeTokenRef.current;
     if (fromInput) sessionDeletedRef.current = 0;
-
     await runClean(authToken);
   }
 
@@ -339,12 +364,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
   const fieldsLocked = isLoading || isSuccess;
 
   return (
-    <form
-      className={styles.form}
-      onSubmit={onSubmit}
-      autoComplete="off"
-      data-form-type="other"
-    >
+    <div className={styles.form}>
       <div
         className={styles.directionChips}
         role="radiogroup"
@@ -382,7 +402,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           ref={tokenRef}
           className={styles.input}
           type="password"
-          name="onion-auth"
           autoComplete="off"
           autoCapitalize="off"
           autoCorrect="off"
@@ -393,7 +412,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
               ? "Token guardado para continuar (ou cole de novo)"
               : "Cole o token aqui"
           }
-          required={!isPaused}
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
@@ -408,7 +426,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         <input
           className={styles.input}
           type="text"
-          name="onion-channel"
           inputMode="numeric"
           autoComplete="off"
           autoCapitalize="off"
@@ -421,7 +438,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           }
           value={channelId}
           onChange={(e) => setChannelId(e.target.value.replace(/\D/g, ""))}
-          required
           disabled={fieldsLocked}
         />
         <span className={styles.helper}>
@@ -435,8 +451,9 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
         {!isPaused && (
           <button
             className={`${styles.submit} ${isSuccess ? styles.submitSuccess : ""}`}
-            type="submit"
+            type="button"
             disabled={fieldsLocked}
+            onClick={() => void startClean()}
           >
             <span className={styles.submitInner}>
               {isSuccess && (
@@ -483,7 +500,7 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
             <button
               className={styles.submit}
               type="button"
-              onClick={onContinue}
+              onClick={() => void onContinue()}
             >
               Continuar limpeza
             </button>
@@ -535,6 +552,6 @@ export function CleanerForm({ mode = "dm" }: { mode?: CleanMode }) {
           <p className={styles.error}>{status.message}</p>
         )}
       </div>
-    </form>
+    </div>
   );
 }

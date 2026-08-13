@@ -1,5 +1,4 @@
-import { deleteMessagesFromChannel } from "@/lib/cleaner";
-import { releaseJob, tryAcquireJob } from "@/lib/jobs";
+import { releaseJob, releaseSessionJobs, tryAcquireJob } from "@/lib/jobs";
 import { logJob } from "@/lib/logger";
 import { enforceRateLimit } from "@/lib/rate-limit";
 import {
@@ -17,6 +16,8 @@ import {
   validateDiscordToken,
 } from "@/lib/security";
 import { readSessionId, SESSION_COOKIE } from "@/lib/session";
+import { abortVoiceWatch } from "@/lib/voice-sessions";
+import { deleteMessagesFromChannel } from "@/lib/cleaner";
 
 export const runtime = "nodejs";
 export const maxDuration = 300;
@@ -127,13 +128,17 @@ export async function POST(request: Request) {
     });
   }
 
-  const slot = tryAcquireJob(sessionId, channelId, mode);
+  // Free any stuck voice-watch / previous clean slot for this browser session
+  abortVoiceWatch(sessionId);
+  releaseSessionJobs(sessionId);
+
+  let slot = tryAcquireJob(sessionId, channelId, mode);
+  if (!slot.ok) {
+    releaseSessionJobs(sessionId);
+    slot = tryAcquireJob(sessionId, channelId, mode);
+  }
   if (!slot.ok) {
     token = "";
-    const message =
-      slot.reason === "duplicate"
-        ? "Já existe uma limpeza deste canal nesta sessão."
-        : "Já existe uma limpeza em andamento nesta sessão (ou o servidor está ocupado).";
     logJob({
       jobId: `rej-${sessionId.slice(0, 8)}`,
       status: "rejected",
@@ -141,7 +146,7 @@ export async function POST(request: Request) {
       mode,
       durationMs: Date.now() - startedAt,
     });
-    return jsonError(message, 429);
+    return jsonError("Servidor ocupado. Tente novamente em instantes.", 429);
   }
 
   const abort = new AbortController();
